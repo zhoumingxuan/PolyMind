@@ -321,7 +321,9 @@ def create_webquestion_from_user(qwen_model: QwenModel, user_message, history_se
 优先检索通用定义/经典做法；若来源存疑或无法核验，请在回答中注明不确定性；不得输出具体论文标题与精确数字。
 
     ## 输出格式
+    - 严格输出原始 JSON 文本，不得附加 Markdown 代码块符号、反引号、注释、自然语言前后缀或任何非 JSON 内容。
     - 返回 JSON 数组，每个元素包含 id（GUID）、question、time（none/week/month/semiyear/year）。
+    - 若暂无法生成搜索问题，直接输出空数组 `[]`，同样不得添加解释。
 """
 
     if history_search:
