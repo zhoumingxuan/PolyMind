@@ -159,15 +159,6 @@ class QwenModel:
                         thinking_budget=1024 * 32,
                         enable_thinking=True,
                         tools=None if no_search else self.tools,
-                        enable_search=True if inner_search else False,
-                        search_options={
-                            "forced_search": True,
-                            "enable_source": False,
-                            "enable_citation": False,
-                            "search_strategy": "pro",
-                        }
-                        if inner_search
-                        else None,
                         stream=True,
                         include_usage=True,
                         incremental_output=True,
