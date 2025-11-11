@@ -4,6 +4,8 @@ import time
 from datetime import datetime
 
 import dashscope
+import requests
+from urllib3.exceptions import ProtocolError
 
 from config import ConfigHelper
 from search_service import web_search
@@ -141,104 +143,120 @@ class QwenModel:
         no_search: bool = False,
         inner_search: bool = False,
     ):
-        response = None
-        while response is None:
+        max_stream_retries = 3
+        attempt = 0
+
+        while True:
+            response = None
+            while response is None:
+                try:
+                    response = dashscope.Generation.call(
+                        api_key=self.api_key,
+                        model=self.model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=1024 * 16,
+                        thinking_budget=1024 * 32,
+                        enable_thinking=True,
+                        tools=None if no_search else self.tools,
+                        enable_search=True if inner_search else False,
+                        search_options={
+                            "forced_search": True,
+                            "enable_source": False,
+                            "enable_citation": False,
+                            "search_strategy": "pro",
+                        }
+                        if inner_search
+                        else None,
+                        stream=True,
+                        include_usage=True,
+                        incremental_output=True,
+                        result_format=result_format,
+                    )
+                except Exception:
+                    response = None
+                    time.sleep(60)
+                    continue
+
+            reasoning_content = []
+            answer_content = []
+            total_tokens = 0
+            tool_response = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": []
+            }
+
+            toolcall_infos = []
+
             try:
-                response = dashscope.Generation.call(
-                    api_key=self.api_key,
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=1024 * 16,
-                    thinking_budget=1024 * 32,
-                    enable_thinking=True,
-                    tools=None if no_search else self.tools,
-                    enable_search=True if inner_search else False,
-                    search_options={
-                        "forced_search": True,
-                        "enable_source": False,
-                        "enable_citation": False,
-                        "search_strategy": "pro",
-                    }
-                    if inner_search
-                    else None,
-                    stream=True,
-                    include_usage=True,
-                    incremental_output=True,
-                    result_format=result_format,
-                )
-            except Exception:
-                response = None
-                time.sleep(60)
+                for chunk in response:
+                    msg = chunk.output.choices[0].message
+
+                    if chunk.get("usage"):
+                        total_tokens = chunk.usage.total_tokens
+
+                    msg_reasoning = self._safe_msg_attr(msg, "reasoning_content", "")
+                    msg_content = self._safe_msg_attr(msg, "content", "")
+                    msg_tool_calls = self._safe_msg_attr(msg, "tool_calls", None)
+
+                    if msg_reasoning and not msg_content:
+                        reasoning_content.append(msg_reasoning)
+
+                    if msg_tool_calls:
+                        for tool_call in msg_tool_calls:
+                            index = tool_call["index"]
+
+                            while len(toolcall_infos) <= index:
+                                toolcall_infos.append({"id": "", "name": "", "arguments": ""})
+
+                            if "id" in tool_call:
+                                toolcall_infos[index]["id"] += tool_call.get("id", "")
+
+                            if "function" in tool_call:
+                                func = tool_call["function"]
+                                if "name" in func:
+                                    toolcall_infos[index]["name"] += func.get("name", "")
+                                if "arguments" in func:
+                                    toolcall_infos[index]["arguments"] += func.get("arguments", "")
+
+                    if msg_content:
+                        chunk_content = msg_content
+                        if stream:
+                            stream.process_chunk(chunk_content)
+                        answer_content.append(chunk_content)
+            except (requests.exceptions.ChunkedEncodingError, ProtocolError):
+                attempt += 1
+                if attempt >= max_stream_retries:
+                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。")
+                time.sleep(2)
                 continue
 
-        reasoning_content = []
-        answer_content = []
-        total_tokens = 0
-        tool_response = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": []
-        }
+            self.total_tokens_count += total_tokens
+            if self.total_tokens_count > 50000:
+                time.sleep(60)
+                self.total_tokens_count = 0
 
+            if toolcall_infos:
+                for t_index, tool_call in enumerate(toolcall_infos):
+                    item = {
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                        "id": tool_call["id"],
+                        "index": t_index,
+                        "type": "function",
+                    }
+                    tool_response["tool_calls"].append(item)
 
-        toolcall_infos = []
-        for chunk in response:
-            msg = chunk.output.choices[0].message
+            answer_text = "".join(answer_content)
+            reasoning_text = "".join(reasoning_content)
+            tool_response["content"] = answer_text
+            tool_response["reasoning_content"] = reasoning_text
+            tool_response["usage"] = {"total_tokens": total_tokens}
 
-            if chunk.get("usage"):
-                total_tokens = chunk.usage.total_tokens
-
-            msg_reasoning = self._safe_msg_attr(msg, "reasoning_content", "")
-            msg_content = self._safe_msg_attr(msg, "content", "")
-            msg_tool_calls = self._safe_msg_attr(msg, "tool_calls", None)
-
-            if msg_reasoning and not msg_content:
-                reasoning_content.append(msg_reasoning)
-
-            if msg_tool_calls:
-                for tool_call in msg_tool_calls:
-                    index = tool_call["index"]
-
-                    while len(toolcall_infos) <= index:
-                        toolcall_infos.append({"id": "", "name": "", "arguments": ""})
-
-                    if "id" in tool_call:
-                        toolcall_infos[index]["id"] += tool_call.get("id", "")
-
-                    if "function" in tool_call:
-                        func = tool_call["function"]
-                        if "name" in func:
-                            toolcall_infos[index]["name"] += func.get("name", "")
-                        if "arguments" in func:
-                            toolcall_infos[index]["arguments"] += func.get("arguments", "")
-
-            if msg_content:
-                chunk_content = msg_content
-                if stream:
-                    stream.process_chunk(chunk_content)
-                answer_content.append(chunk_content)
-
-        self.total_tokens_count += total_tokens
-        if self.total_tokens_count > 50000:
-            time.sleep(60)
-            self.total_tokens_count = 0
-
-        if toolcall_infos:
-            for t_index, tool_call in enumerate(toolcall_infos):
-                item = {
-                    "function": {
-                        "name": tool_call["name"],
-                        "arguments": tool_call["arguments"],
-                    },
-                    "id": tool_call["id"],
-                    "index": t_index,
-                    "type": "function",
-                }
-                tool_response["tool_calls"].append(item)
-                
-
-        return "".join(answer_content), "".join(reasoning_content), tool_response
+            return answer_text, reasoning_text, tool_response
 
     def do_call(
         self,
