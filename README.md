@@ -86,12 +86,22 @@ flowchart TD
 当遇到复杂问题或缺乏明确思路时，用户可以将问题作为需求输入，并调用`start_meeting`启动讨论研究。如果用户需求更为明确（例如规范、限定条件或生成目标效果），将有助于生成更精确的结果。`test.py`中包含三个测试用例，用户可以运行进行验证。
 
 ### 配置
-* `setting.json`是配置文件，包含以下字段：
+* `setting.json` 是配置文件，包含以下核心字段：
 
-  * `max_epcho`：最大讨论轮数，研究员按顺序发言后算作一轮，超过此轮数后自动终止讨论。
+  * `max_epcho`：最大讨论轮数，研究员按顺序发言后算作一轮。
   * `role_count`：生成的角色数量。
-  * `baidu_key`：百度AI搜索的API Key。
-  * `qwen_key`：Qwen模型的API Key。
+  * `qwen_key`：通义千问模型 API Key，既用于对话也可作为 DashScope 搜索的默认密钥。
+  * `search_provider`：网络搜索提供方，当前支持 `dashscope`（默认）与 `baidu`。
+  * `dashscope_search_key`：DashScope WebSearch 专用密钥（可复用 `qwen_key`）。
+  * `dashscope_search_endpoint`：DashScope WebSearch 接口地址，默认 `https://dashscope.aliyuncs.com/api/v1/services/aigc/websearch`。
+  * `baidu_key`：百度千帆智能搜索密钥（仅在选择 `baidu` 提供方时需要）。
+  * `search_top_k`：检索结果条数上限。
+  * `search_timeout`：搜索 HTTP 请求超时时间（秒）。
+
+### 搜索服务配置
+- 默认使用 **阿里云通义千问 WebSearch API**（国内可用，具备来源、引用信息），只需在 `setting.json` 中填入 `dashscope_search_key` 即可。
+- 如需改用其他国内搜索服务，可将 `search_provider` 切换为 `baidu`，并填入 `baidu_key`。新的搜索接口可以通过扩展 `search_service.py` 中的提供方类接入。
+- 若需要接入自定义国内搜索 API，可保持 `search_provider` 为 `dashscope`，改写 `dashscope_search_endpoint`、`search_top_k` 等参数，或仿照现有类新增实现。
 
 ### 启动流程
 1. 创建 `QwenModel` 实例：`qwen_model = QwenModel(model_name="qwen-plus-latest")`
