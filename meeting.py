@@ -171,7 +171,95 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
         system_prompt, user_prompt, no_search=True, inner_search=True
     )
 
-    return answer
+    focus_profile = build_search_focus_profile(
+        qwen_model, now_date, user_content, answer
+    )
+
+    return answer, focus_profile
+
+
+def build_search_focus_profile(
+    qwen_model: QwenModel, now_date, user_content, knowledge_outline
+):
+    """根据知识梳理结果统一输出“搜索关注要素”。"""
+
+    system_prompt = f"""
+你是检索策略规划师，需要结合用户需求与已整理的知识，生成一份可供后续流程复用的“搜索关注要素”配置。
+
+## 基本信息
+- 当前日期：{now_date}
+- 背景：系统已完成基础知识梳理，必须锁定检索端的重点，避免角色随意发挥。
+
+## 任务
+1. 阅读用户需求与知识提要，提炼网络检索必须满足的条件。
+2. 针对下列维度分别给出等级（高/中/低）及简要理由：
+   - 时效性
+   - 规范性 / 专业性 / 严谨性
+   - 经验性
+   - 创新性
+   - 效率性
+3. 如需额外提醒（例如：必须引用法规、需要多地区对比、需要量化指标等），写入 extraNotes，可为空数组。
+4. 仅输出 JSON，结构示例：
+```
+{{
+  "timeliness": {{"level": "高", "reason": "说明"}},
+  "compliance": {{"level": "中", "reason": "说明"}},
+  "experience": {{"level": "低", "reason": "说明"}},
+  "innovation": {{"level": "中", "reason": "说明"}},
+  "efficiency": {{"level": "高", "reason": "说明"}},
+  "extraNotes": [["提醒1", "提醒2"]]
+}}
+```
+
+[[PROMPT-GUARD v1 START]]
+【禁止越界】
+- 禁止输出会议/活动/人物/机构的隐私信息、账号、联系方式及可复识别细节。
+- 禁止捏造实验、测试、代码执行、模型调用或未验证的结论。
+- 允许引用公开资料，但必须说明用途与适用范围，不得冒充内部结果。
+- 不得讨论与任务无关的事件。
+
+【信息不足处理】
+- 若证据不足，请明确写出“信息不足，以下为合理推测”，并说明前提。
+[[PROMPT-GUARD v1 END]]
+    """
+
+    user_prompt = f"""
+# 用户需求
+```
+{user_content}
+```
+
+# 知识提要
+```
+{knowledge_outline}
+```
+
+[[PROMPT-GUARD v1 START]]
+【禁止越界】
+- 禁止输出隐私信息或与任务无关的内容。
+- 禁止捏造来源、数据或实验。
+
+【信息不足处理】
+- 若缺乏证据，请说明信息不足并给出推测前提。
+[[PROMPT-GUARD v1 END]]
+    """
+
+    answer, reasoning, web_content_list, reference_list = qwen_model.do_call(
+        system_prompt, user_prompt, no_search=True, inner_search=False
+    )
+
+    cleaned = answer.strip()
+    start_index = cleaned.find("{")
+    end_index = cleaned.rfind("}")
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        cleaned = cleaned[start_index:end_index + 1]
+
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        data = {"搜索关注要素": cleaned}
+
+    return json.dumps(data, ensure_ascii=False, indent=2)
 
 
 def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
@@ -181,9 +269,10 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     knowledges = None
     knowledges, refs = create_webquestion_from_user(qwen_model, content, knowledges, now_date)
 
-    know_data = rrange_knowledge(qwen_model, knowledges, refs, content)
+    know_data, search_focus = rrange_knowledge(qwen_model, knowledges, refs, content)
 
     print("\n\n基础资料:\n\n", know_data)
+    print("\n\n重点关注要素:\n\n", search_focus)
 
     roles = create_roles(qwen_model, content, know_data, stream=stream)
 
@@ -208,6 +297,7 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
                 his_nodes,
                 round_record,
                 know_data,
+                search_focus,
                 now_date,
                 role,
                 epcho,
@@ -220,10 +310,19 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
 
         print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
 
-        msg_content = summary_round(qwen_model, content, now_date, round_record, epcho)
+        msg_content = summary_round(
+            qwen_model, content, now_date, round_record, epcho, search_focus
+        )
 
         sugg_content, can_end = summary_sugg(
-            qwen_model, content, now_date, msg_content, his_nodes, epcho, MAX_EPCHO
+            qwen_model,
+            content,
+            now_date,
+            msg_content,
+            his_nodes,
+            epcho,
+            MAX_EPCHO,
+            search_focus,
         )
 
         last_content = f"""
@@ -255,7 +354,9 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
 
     print("\n====输出最终报告====\n")
 
-    return summary(qwen_model, content, now_date, his_nodes, know_data, stream=stream)
+    return summary(
+        qwen_model, content, now_date, his_nodes, know_data, search_focus, stream=stream
+    )
 
 
 def summary_sugg(
@@ -266,6 +367,7 @@ def summary_sugg(
     his_nodes,
     epcho,
     max_epcho,
+    search_focus,
     stream: AIStream = None,
 ):
     """生成当前讨论进度与后续建议。"""
@@ -277,6 +379,11 @@ def summary_sugg(
 - 当前日期：{now_date}
 - 当前轮次：第{epcho}轮 / 共 {max_epcho} 轮
 - 模式：理论研究，禁止实验、测试、代码执行。
+- 检索关注要素：所有决策需符合下方配置，必要时提醒研究员遵守对应的时效性/规范性/经验性/创新性/效率性等级。
+
+```
+{search_focus}
+```
 
 ## 任务
 1. 将本轮讨论与历史总结进行综合比对，明确：
@@ -374,6 +481,7 @@ def summary_round(
     now_date,
     round_record,
     epcho,
+    search_focus,
     stream: AIStream = None,
 ):
     """单轮讨论总结。"""
@@ -384,6 +492,11 @@ def summary_round(
 ## 基本信息
 - 当前日期：{now_date}
 - 模式：仅记录，不新增观点。
+- 检索关注要素：请对照下方配置，保持时效性/规范性/经验性/创新性/效率性的约束一致。
+
+```
+{search_focus}
+```
 
 ## 输入
 - 用户需求：{content}
@@ -440,6 +553,7 @@ def summary(
     now_date,
     his_nodes,
     knowledge,
+    search_focus,
     stream: AIStream = None,
 ):
     """会议最终总结。"""
@@ -452,6 +566,10 @@ def summary(
 - 用户需求：
 ```
 {dt_content}
+```
+- 检索关注要素：所有最终结论都要说明如何满足下方约束，必要时提示残留风险。
+```
+{search_focus}
 ```
 
     ## 任务
