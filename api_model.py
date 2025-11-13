@@ -1,41 +1,51 @@
-import os
-import dashscope
 import json
-import time
 import re
 import time
 from datetime import datetime
-from search_service import  web_search
+
+import dashscope
+import requests
+from urllib3.exceptions import ProtocolError
+
 from config import ConfigHelper
+from search_service import web_search
 
 config = ConfigHelper()
 
+DASHSCOPE_API_KEY = config.get("qwen_key", None)
 
-DASHSCOPE_API_KEY=config.get("qwen_key", None)
 
 class AIStream:
     def __init__(self):
-        self.buffer=[]
+        self.buffer = []
 
-    def process_chunk(self,chunk):
-        print(chunk,end='',flush=True)
+    def process_chunk(self, chunk):
+        print(chunk, end="", flush=True)
 
 
 class QwenModel:
-
     def __init__(self, model_name):
         self.api_key = DASHSCOPE_API_KEY
         self.model = model_name
         self.total_tokens_count = 0
+        self.tools = self._build_search_tool()
 
-        self.tools = [{
+    @staticmethod
+    def _build_search_tool():
+        return [{
             "type": "function",
             "function": {
                 "name": "web_search",
                 "description": """
-              **函数说明**
-               1.用于查处网络资料的函数，支持多个网络搜索问题，但必须确保每个问题都不重复。
-            """,
+【工具定位】
+- 根据 question_list 中的指令批量执行 1~10 条网络搜索。
+- 搜索结果必须来自真实网页，并保留可追溯的来源。
+
+【调用规范】
+1. 问题需覆盖用户提供的时间、地点、人物与限制条件。
+2. question_list 必须是 JSON 数组，所有标点使用英文符号。
+3. 严禁生成重复或语义接近的问题，禁止含糊表述。
+""",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": False,
@@ -50,29 +60,34 @@ class QwenModel:
                                 "properties": {
                                     "id": {
                                         "type": "string",
-                                        "description": "GUID类型，每个都必须不重复"
+                                        "description": "GUID，必须全局唯一。"
                                     },
                                     "question": {
                                         "type": "string",
                                         "minLength": 5,
-                                        "description": "需要在网络中查找的具体问题，必须明确、清晰;且必须严格确保每个问题都不重复，包括含义也都不重复。特别强调，生成的问题尽可能使用中文。"
+                                        "description": "明确的中文问题，需包含上下文约束，禁止模糊或重复内容。"
                                     },
                                     "time": {
                                         "type": "string",
                                         "enum": ["none", "week", "month", "semiyear", "year"],
                                         "default": "none",
-                                        "description": "按网页发布时间筛选：none 不限；week 最近7天；month 最近30天；semiyear 最近180天；year 最近365天。"
+                                        "description": "按网页发布时间筛选：none（不限）、week（7 天）、month（30 天）、semiyear（180 天）、year（365 天）。"
                                     }
                                 },
                                 "required": ["id", "question", "time"]
                             },
                             "description": """
-               需要在互联网中查找的问题列表,数组格式，禁止生成重复的问题或者含义相同的问题。
+必填。数组中每个元素描述一条搜索需求：
+- id：GUID，确保唯一。
+- question：5 字以上的明确中文问题，必须体现用户需求里的关键条件。
+- time：时间筛选范围（none/week/month/semiyear/year）。
 
-               - 该参数为数组类型，请必须严格注意数组格式，相关格式涉及的标点符号都必须使用英文符号。
-
-               - 最多只有10个问题。
-            """
+请确保：
+1. 最多 10 个问题；
+2. 问题之间完全不重复；
+3. 语义清晰、可直接执行；
+4. 所有标点均使用英文符号。
+"""
                         }
                     },
                     "required": ["question_list"]
@@ -80,368 +95,506 @@ class QwenModel:
             }
         }]
 
-    def do_tool_calls(self,tool_calls, messages):
-     for tool_call in tool_calls:
-      func_name = tool_call['function']['name']
-      args_data = tool_call['function']['arguments']
-      t_id=tool_call['id']
+    @staticmethod
+    def _parse_tool_arguments(raw_arguments: str):
+        start_index = raw_arguments.find("[")
+        end_index = raw_arguments.rfind("]")
+        if start_index != -1 and end_index != -1:
+            raw_arguments = raw_arguments[start_index:end_index + 1]
+        raw_arguments = re.sub(r"}\s*，\s*{", "},{", raw_arguments)
+        raw_arguments = raw_arguments.strip() or "[]"
+        return json.loads(raw_arguments)
 
-      startIndex = args_data.find("[")
-      endIndex = args_data.rfind("]")
+    @staticmethod
+    def _safe_msg_attr(msg, attr, default=None):
+        try:
+            return getattr(msg, attr)
+        except (AttributeError, KeyError):
+            return default
 
-      if startIndex != -1 and endIndex != -1:
-        args_data = args_data[startIndex:endIndex+1]
+    def do_tool_calls(self, tool_calls, messages):
+        for tool_call in tool_calls:
+            func_name = tool_call["function"]["name"]
+            args_data = tool_call["function"].get("arguments", "[]")
+            tool_id = tool_call["id"]
 
-      args_data = re.sub(r'}\s*，\s*{', '},{', args_data)
+            parsed_args = self._parse_tool_arguments(args_data)
+            args = {"question_list": parsed_args}
 
-      args = json.loads(args_data)
+            data_content = None
+            refs = []
 
-      args = {
-          "question_list": args
-      }
+            if func_name == "web_search":
+                data_content, ref_data = search_list(**args)
+                refs.extend(ref_data)
 
-      data_content = None
-      refs=[]
+            messages.append(
+                {"role": "tool", "tool_call_id": tool_id, "content": data_content}
+            )
 
-      if func_name == "web_search":
-          data_content,ref_data = search_list(**args)
-          refs.extend(ref_data)
+            return data_content, refs
 
-      messages.append(
-          {"role": "tool", "tool_call_id": t_id, "content": data_content})
+    def send_messages(
+        self,
+        messages,
+        stream: AIStream = None,
+        temperature: float = 0.5,
+        result_format: str = "message",
+        no_search: bool = False,
+        inner_search: bool = False,
+    ):
+        max_stream_retries = 3
+        attempt = 0
 
-      return data_content,refs
+        time.sleep(5)
 
+        while True:
+            response = None
+            while response is None:
+                try:
+                    response = dashscope.Generation.call(
+                        api_key=self.api_key,
+                        model=self.model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=1024 * 16,
+                        thinking_budget=1024 * 32,
+                        enable_thinking=True,
+                        tools=None if no_search else self.tools,
+                        enable_search=True if inner_search else False,  # 开启联网搜索的参数
+                        search_options={
+                            "forced_search": True,  # 强制开启联网搜索
+                            "enable_source": False,  # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
+                            "enable_citation": False,  # 开启角标标注功能
+                            "search_strategy": "pro"  # 模型将搜索10条互联网信息
+                        } if inner_search else None,
+                        stream=True,
+                        include_usage=True,
+                        incremental_output=True,
+                        result_format=result_format,
+                    )
+                except Exception:
+                    response = None
+                    time.sleep(60)
+                    continue
 
-    def send_messages(self, messages,stream:AIStream=None,temperature=0.5,result_format="message",no_search=False,inner_search=False):
-        response = None
-        while response is None:
+            reasoning_content = []
+            answer_content = []
+            total_tokens = 0
+            tool_response = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": []
+            }
+
+            toolcall_infos = []
+
             try:
-                response = dashscope.Generation.call(
-                    api_key=self.api_key,
-                    model=self.model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=1024*16, # 最大输出长度
-                    thinking_budget=1024*32, # 思考预算，单位是token
-                    enable_thinking = True,
-                    tools=None if no_search else self.tools,
-                    enable_search = True if inner_search else False, # 开启联网搜索的参数
-                    search_options =  {
-                        "forced_search": True, # 强制开启联网搜索
-                        "enable_source": False, # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
-                        "enable_citation": False, # 开启角标标注功能
-                        "search_strategy": "pro" # 模型将搜索10条互联网信息
-                    } if inner_search else None,
-                    stream=True,
-                    include_usage=True,
-                    incremental_output=True,
-                    result_format=result_format
-                )
-            except Exception as e:
-                response = None
-                time.sleep(60)
+                for chunk in response:
+                    msg = chunk.output.choices[0].message
+
+                    if chunk.get("usage"):
+                        total_tokens = chunk.usage.total_tokens
+
+                    msg_reasoning = self._safe_msg_attr(msg, "reasoning_content", "")
+                    msg_content = self._safe_msg_attr(msg, "content", "")
+                    msg_tool_calls = self._safe_msg_attr(msg, "tool_calls", None)
+
+                    if msg_reasoning and not msg_content:
+                        reasoning_content.append(msg_reasoning)
+
+                    if msg_tool_calls:
+                        for tool_call in msg_tool_calls:
+                            index = tool_call["index"]
+
+                            while len(toolcall_infos) <= index:
+                                toolcall_infos.append({"id": "", "name": "", "arguments": ""})
+
+                            if "id" in tool_call:
+                                toolcall_infos[index]["id"] += tool_call.get("id", "")
+
+                            if "function" in tool_call:
+                                func = tool_call["function"]
+                                if "name" in func:
+                                    toolcall_infos[index]["name"] += func.get("name", "")
+                                if "arguments" in func:
+                                    toolcall_infos[index]["arguments"] += func.get("arguments", "")
+
+                    if msg_content:
+                        chunk_content = msg_content
+                        if stream:
+                            stream.process_chunk(chunk_content)
+                        answer_content.append(chunk_content)
+            except (requests.exceptions.ChunkedEncodingError, ProtocolError):
+                attempt += 1
+                if attempt >= max_stream_retries:
+                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。")
+                time.sleep(2)
                 continue
-        
-        reasoning_content=[]
-        answer_content=[]
 
-        total_tokens=0
-        tool_response={
-            "role":"assistant",
-            "content": "",
-            "tool_calls": []
-        }
-        
-        toolcall_infos=[]
-        for chunk in response:
-            # 如果思考过程与回复皆为空，则忽略
-            msg = chunk.output.choices[0].message
+            self.total_tokens_count += total_tokens
+            if self.total_tokens_count > 50000:
+                time.sleep(60)
+                self.total_tokens_count = 0
 
-            if chunk.get("usage"):
-                total_tokens = chunk.usage.total_tokens
+            if toolcall_infos:
+                for t_index, tool_call in enumerate(toolcall_infos):
+                    item = {
+                        "function": {
+                            "name": tool_call["name"],
+                            "arguments": tool_call["arguments"],
+                        },
+                        "id": tool_call["id"],
+                        "index": t_index,
+                        "type": "function",
+                    }
+                    tool_response["tool_calls"].append(item)
 
-            if (msg.reasoning_content != "" and msg.content == ""):
-                reasoning_content.append(msg.reasoning_content)
-            if 'tool_calls' in msg and msg.tool_calls:
-                for tool_call in msg.tool_calls:
-                    index = tool_call['index']
+            answer_text = "".join(answer_content)
+            reasoning_text = "".join(reasoning_content)
+            tool_response["content"] = answer_text
+            tool_response["reasoning_content"] = reasoning_text
+            tool_response["usage"] = {"total_tokens": total_tokens}
 
-                    while len(toolcall_infos) <= index:
-                        toolcall_infos.append({'id': '', 'name': '', 'arguments': ''})  # 初始化所有字段
+            return answer_text, reasoning_text, tool_response
 
-                    if 'id' in tool_call:
-                        toolcall_infos[index]['id'] += tool_call.get('id', '')
-                        
-                    # 增量更新函数信息
-                    if 'function' in tool_call:
-                        func = tool_call['function']
-                        # 增量更新函数名称
-                        if 'name' in func:
-                            toolcall_infos[index]['name'] += func.get('name', '')
-                        # 增量更新参数
-                        if 'arguments' in func:
-                            toolcall_infos[index]['arguments'] += func.get('arguments', '')
-
-            if msg.content != "":
-                chunk_content=msg.content
-                if stream:
-                    stream.process_chunk(chunk_content)
-                answer_content.append(chunk_content)
-
-        self.total_tokens_count += total_tokens
-
-        if self.total_tokens_count>50000:
-            time.sleep(60)
-            self.total_tokens_count=0
-
-        if len(toolcall_infos)>0:
-            for t_index,tool_call in enumerate(toolcall_infos):
-                item={
-                    "function": {
-                        "name": tool_call['name'],
-                        "arguments": tool_call['arguments']
-                    },
-                    "id": tool_call['id'],
-                    "index": t_index,
-                    "type": "function"
-                }
-                tool_response['tool_calls'].append(item)
-               
-        return "".join(answer_content), "".join(reasoning_content),tool_response
-
-    def do_call(self, system_prompt,user_prompt, stream:AIStream=None, temperature=0.5,no_search=False,inner_search=False,result_format="message"):
+    def do_call(
+        self,
+        system_prompt,
+        user_prompt,
+        stream: AIStream = None,
+        temperature: float = 0.5,
+        no_search: bool = False,
+        inner_search: bool = True,
+        result_format: str = "message",
+    ):
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
-        web_content_list=[]
-        answer, reasoning,tool_response = self.send_messages(messages, stream, temperature=temperature,no_search=no_search,inner_search=inner_search,result_format=result_format)
-        
-        references=[]
-        while len(tool_response['tool_calls'])>0:
+
+        web_content_list = []
+        answer, reasoning, tool_response = self.send_messages(
+            messages,
+            stream,
+            temperature=temperature,
+            no_search=no_search,
+            inner_search=inner_search,
+            result_format=result_format,
+        )
+
+
+        references = []
+        while tool_response["tool_calls"]:
             messages.append(tool_response)
-            web_search_list,web_references=self.do_tool_calls(tool_response['tool_calls'], messages)
-            web_content_list.extend(web_search_list)
-            references.extend(web_references)
-            answer, reasoning,tool_response = self.send_messages(messages, stream, temperature=temperature,no_search=no_search,inner_search=inner_search,result_format=result_format)
+            web_search_list, web_references = self.do_tool_calls(
+                tool_response["tool_calls"], messages
+            )
+            web_content_list.extend(web_search_list or [])
+            references.extend(web_references or [])
+            answer, reasoning, tool_response = self.send_messages(
+                messages,
+                stream,
+                temperature=temperature,
+                no_search=no_search,
+                inner_search=inner_search,
+                result_format=result_format,
+            )
 
-        return answer, reasoning,web_content_list,references
+        return answer, reasoning, web_content_list, references
 
 
-def create_webquestion_from_user(qwen_model:QwenModel,user_message,history_search,now_date):
-   
-   system_prompt = f"""
+def create_webquestion_from_user(
+    qwen_model: QwenModel, user_message, history_search, now_date, search_focus=None
+):
+    system_prompt = f"""
+你是搜索任务规划师，负责为多智能体系统生成高质量的网络检索问题。
 
-    当前日期: "{now_date}"
+## 基本信息
+- 当前日期：{now_date}
 
-    # 任务
+## 任务目标
+1. 逐条解析用户需求，提炼必须查证的事实、定义、规范、数据等要点。
+2. 结合输入中出现的时间、地点、人物、事件与特别强调内容，生成可直接执行的搜索问题。
+3. 若提供历史搜索结果，需基于其中的事实识别信息缺口，避免重复查询，强化深入性问题。
 
-     1. 严格根据用户输入的需求（尤其注意提及的时间、地点、人物、事件、以及特别强调的内容），生成需要网络搜索的问题，确保能够对用户输入的需求有更深刻和专业的理解。关键在于根据用户提供的信息，理解其核心需求，并通过问题引导深入搜索。
+    ## 编写规则
+    - 问题需按“一个问题解决一个信息缺口”的原则组织，禁止冗余。
+    - 优先生成：行业规范/定义 → 关键背景/数据 → 深度洞察/争议点。
+    - 问题必须用中文，语义明确，避免泛化或含糊词。
+    - 若用户需求中包含时间约束，需与当前日期核对后再写入问题。
 
-     2. 若提供历史搜索数据，必须利用历史数据中的信息，围绕当前用户需求生成更有深度的问题，推动搜索结果更贴合用户的目标。历史数据应被视为已知知识库，并在问题生成过程中发挥作用。
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
+- 不得讲与任务无关的行业故事。
 
-     3. 问题生成优先级：
-        - 先根据行业规范、专业定义或相关名称解释生成问题；
-        - 然后生成能够进一步提升对用户需求理解的深度问题。
-    
-    # 强制要求与规范
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
 
-     1. 严格依据用户输入中涉及的时间、地点、人物、事件、特别强调的内容，生成的问题应符合这些要求。若涉及时间，必须与当前日期核对，确保时间范围和相关事件精确无误。
+[[PROMPT-GUARD v1 END]]
+优先检索通用定义/经典做法；若来源存疑或无法核验，请在回答中注明不确定性。
 
-     2. 当前模型处于"纯文本处理模式"。不允许使用任何外部知识或模型内置信息，只能从用户提供的文字信息中理解并生成问题。
+    ## 输出格式
+    - 严格输出原始 JSON 文本，不得附加 Markdown 代码块符号、反引号、注释、自然语言前后缀或任何非 JSON 内容。
+    - 返回 JSON 数组，每个元素包含 id（GUID）、question、time（none/week/month/semiyear/year）。
+    - 若暂无法生成搜索问题，直接输出空数组 `[]`，同样不得添加解释。
+"""
 
-     3. 所有生成问题的素材必须完全基于用户输入的文本。禁止参考任何外部资料或其他模型的内置知识。
+    if history_search:
+        system_prompt += f"""
+## 历史搜索数据
+以下为已获取的搜索结果，可直接引用，不要重复生成同义问题：
+```json
+{json.dumps(history_search, ensure_ascii=False, indent=2)}
+```
+"""
 
-     4. 生成的问题应严格符合用户需求，并旨在通过网络搜索为用户提供更深入的信息理解。无需关注立即解决用户需求，但需在进一步探索中获取更多信息。
+    if search_focus:
+        system_prompt += f"""
+## 搜索关注要素
+```
+{search_focus}
+```
+- 所有检索约束都要结合该配置给出的时效性、规范性、经验性、创新性与效率要求，禁止遗漏或混淆。
+"""
 
-     5. 所有问题必须明确、清晰，避免含糊或模糊不清的表述。
+    user_prompt = user_message
 
-    # 输出
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt, user_prompt, temperature=0.5, no_search=True
+    )
 
-     输出格式为一个JSON数组，包含需执行网络搜索的相关问题集合。每个元素必须严格遵循以下格式：
-     
-        a. id: 问题ID，必须为GUID格式，确保每个问题的ID唯一。
-        
-        b. question: 需要执行网络搜索的具体问题。
-        
-        c. time: 搜索时的时间范围，枚举值为: none（不限制），week（最近7天），month（最近30天），semiyear（最近180天），year（最近365天）。
+    answer = answer.strip()
+    start_index = answer.find("[")
+    end_index = answer.rfind("]")
 
-    """
-   if history_search:
-       system_prompt+=f"""
-       #历史搜索
-       1.以下是之前通过网络搜索找到的数据，数据是JSON数组格式，字段说明如下:
-          a. question 搜索网络的问题
-
-          b. result 搜索网络的结果
-
-       2. 网络资料
-         ```json
-           {json.dumps(history_search, ensure_ascii=False, indent=2)}
-         ```
-
-       """
-   
-   user_prompt = user_message
-    
-   answer, reasoning,web_content_list,references =qwen_model.do_call(system_prompt, user_prompt,temperature=0.5,no_search=True)
-
-   answer = answer.strip()
-   startIndex= answer.find("[")
-   endIndex = answer.rfind("]")
-
-   if startIndex != -1 and endIndex != -1:
-        answer = answer[startIndex:endIndex+1]
-   else:
+    if start_index != -1 and end_index != -1:
+        answer = answer[start_index:end_index + 1]
+    else:
         raise ValueError("无法从回答中提取JSON对象")
-    
-   data=json.loads(answer)
-   
-   refs=[]
-   list=[]
-   for item in data:
 
-      question=item['question']
-      time=item['time']
-      
-      print("需要搜索的问题:",question,"\n\n")
-      web_content,ref_items=web_search(question,time)
+    data = json.loads(answer)
 
-      refs.extend(ref_items)
+    refs = []
+    results = []
+    for item in data:
+        question = item["question"]
+        time_range = item["time"]
 
-      list.append({
-          'question':question,
-          'result':web_content
-      })
-   
-   return list,refs
+        print("需要搜索的问题:", question, "\n\n")
+        web_content, ref_items = web_search(question, time_range)
+
+        refs.extend(ref_items)
+
+        results.append({
+            "question": question,
+            "result": web_content
+        })
+
+    return results, refs
+
 
 def search_list(question_list):
-
     seen = set()
-
-    un_questions = []
+    unique_questions = []
 
     for item in question_list:
-        question= item.get("question")
+        question = item.get("question")
         if not question:
             continue
-        time=item.get("time","none")
-    
-        key = f"Question:`{question}`====Time:`{time}`"
-        if key not in seen:          # 首次出现
+        time_range = item.get("time", "none")
+        key = f"Question:`{question}`====Time:`{time_range}`"
+        if key not in seen:
             seen.add(key)
-            un_questions.append({"question":question,"time":time})
+            unique_questions.append({"question": question, "time": time_range})
 
-    if len(un_questions)==0:
-        return []
-    
-    refs=[]
-    t_list=[]
-    for item in un_questions:
+    if not unique_questions:
+        return [], []
 
-      question=item.get("question")
-      if not question:
-          continue
-      time=item.get("time","none")
-      
-      print("需要搜索的问题:",question,"\n\n")
-      web_content,refs_items=web_search(question,time)
+    refs = []
+    results = []
+    for item in unique_questions:
+        question = item.get("question")
+        if not question:
+            continue
+        time_range = item.get("time", "none")
 
-      t_list.append({
-          'question':question,
-          'result':web_content
-      })
+        print("需要搜索的问题:", question, "\n\n")
+        web_content, refs_items = web_search(question, time_range)
 
-      refs.extend(refs_items)
-    
-    return t_list,refs
+        results.append({
+            "question": question,
+            "result": web_content
+        })
+        refs.extend(refs_items)
+
+    return results, refs
 
 
-def update_knowledge(qwen_model:QwenModel,now_date,content,history_know,know_list,references):
-   
-   system_prompt = f"""
+def update_knowledge(qwen_model: QwenModel, now_date, content, history_know, know_list, references):
+    system_prompt = f"""
+你是知识整理专家，负责将最新搜索内容沉淀为可追溯的知识。
 
-   [当前日期]:"{now_date}"
+## 当前日期
+- {now_date}
 
-     #用户需求
+## 用户需求
+```
+{content}
+```
 
-      ```
-        {content}
-      ```
+## 工作流程
+1. **过滤**：剔除纯结论/建议/计划类语句，仅保留与需求高度相关且可追溯的信息。
+2. **归纳**：对过滤后的内容去重、分类、概括，并保留关键事实（人物、地点、时间、数值、来源）。
+3. **缺失**：记录仍未找到的信息及缺失原因。
 
-    # 输入
-      1. 用户提供的 **知识库原始内容**  
-      2. 用户提供的 **最新网络搜索结果**
+## 输出结构
+必须严格按以下章节输出（无内容时写“（无）”）：
+- 名词解释
+- 规范
+- 相关数据
+- 新闻事件
+- 论文参考
+- 示例
+- 其他知识
+- 未找到的信息
 
-    # 工作流程
-      1. **过滤**  
-         - 从“最新网络搜索结果”中移除含有**纯粹结论、建议、计划性质的语句**；保留与用户需求高度相关的资料、数据、案例、规范、名词解释等信息。  
-         - 严格避免包含没有明确来源的虚构内容。**所有资料必须有明确且可追溯的来源**（如网站、作者、时间等）。  
-         
-      2. **归纳**  
-         - 对过滤后的内容进行**去重、分类、概括**，确保关键信息完整并**标注来源**，避免任何虚构的内容。  
-         
-      3. **缺失项**  
-         - 对于用户需求中提及但在输入中“未找到”的信息，记录于“未找到的信息”章节，并**显式标注“未找到”**，并明确为何无法获取。
+    ## 约束
+    - 每条信息需注明至少两个可核验要素（如来源+时间、来源+作者等），禁止虚构。
+    - 若资料存疑或来源缺失，应明确提示。
+    - 不允许混淆“原始知识库”与“最新搜索结果”，请以事实准确为唯一优先级。
 
-         
-    # 输出
-       
-       - **严格仅输出下列章节标题及其内容，不得新增或省略章节，必须严格以符合用户需求，且对于用户需求来说具有高价值为最主要目标进行整理。**
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
+- 不得讲与任务无关的行业故事。
 
-       - 严格注意资料的**信息要素**（如时间、地点、人物、作者、出处等），**禁止遗漏或篡改任何信息要素**，确保每个信息都能够追溯到其来源。
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
 
-       - **可针对"当前网络搜索获得的信息"进一步执行网络搜索**，如果资料不符合事实逻辑或者不够完整，进行补充和修订，保证**来源明确**，避免使用无法追溯的资料。
+[[PROMPT-GUARD v1 END]]
+    """
 
-         - 若某章节没有内容，**请保留章节标题并写“（无）”**。  
-         
-         - 章节顺序：  
-           ## 名词解释  
-           ## 规范  
-           ## 相关数据  
-           ## 新闻事件  
-           ## 论文参考  
-           ## 示例  
-           ## 其他知识点  
-           ## 未找到的信息  
-        
-        - 每条子项以**序号开头**；如引用外部来源，请附简短出处或链接，确保**所有引用均注明来源**。
+    user_prompt = f"""
+# 既有知识
+```
+{history_know}
+```
 
-        - 不得遗失、篡改任何输入信息；可适当精简信息内容，但**必须保持信息完整性**。
+# 最新网络搜索结果
+```json
+{json.dumps(know_list, ensure_ascii=False, indent=2)}
+```
 
-        - 整理的资料必须**明确、准确地说明资料的数据来源**，如网站或网址、作者、时间、地点、人物、机构、单位、论文标题、文章出处、法规或法律条文出处等中的至少两个。如果无法准确提供来源，必须**进行适当标注**，且**不得隐瞒来源的缺失**。
+# 相关引用
+```json
+{json.dumps(references, ensure_ascii=False, indent=2)}
+```
 
-        - **特别强调**：知识库内容若以标注来具体来源，则必须严格保留不得对来源执行任何修改，确保来源可以被追溯；若是多个来源合并，可以追加来源。
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
+- 不得讲与任务无关的行业故事。
 
-        - **特别强调**：来源标注必须是可靠的（例如，有明确的网站或网址、文章标题、作者、时间等中的至少两个），否则视为"来源缺失"。
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
 
-        - **特别强调**：网络搜索问题本身严格禁止在来源标注中出现，只需聚焦于**网络搜索结果摘要的来源**。
+[[PROMPT-GUARD v1 END]]
+"""
 
-        - **特别强调**：来源中不必特别区分"知识库原始内容"和"最新网络搜索结果"，这不是整理资料的目的。
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt,
+        user_prompt,
+        temperature=0.5,
+        no_search=True,
+        inner_search=True,
+    )
 
-   """
-   
-   user_prompt = f"""
-     #知识库
-     ```
-       {history_know}
-     ```
+    return answer.strip()
 
-     #当前网络搜索获得的信息
-     ``` json
-       {json.dumps(know_list, ensure_ascii=False, indent=2)}
-     ```
 
-     #相关网络引用参考
-      ``` json
-        {json.dumps(references, ensure_ascii=False, indent=2)}
-      ```
-   """
-    
-   answer, reasoning,web_content_list,references = qwen_model.do_call(system_prompt, user_prompt,temperature=0.5,no_search=True,inner_search=True)
+def verify_knowledge_post_speech(qwen_model: QwenModel, now_date, role_answer, history_know):
+    system_prompt = f"""
+你是知识稽核员，负责根据研究员的最新发言（尤其是核验结论）整理当前知识库。
 
-   answer = answer.strip()
+## 当前日期
+- {now_date}
 
-   return answer
+## 稽核任务
+1. 解析发言中的核验链（核验对象/结论/证据/交接要点），识别哪些知识被确认通过、被判错或仍待补证。
+2. 将被判错、来源缺失或时间失效的条目移入“已淘汰知识”，并写明淘汰原因及涉及的来源、时间戳。
+3. 保留已核验通过与尚未覆盖的条目，完整继承其来源网站/出版方、作者或责任团队、采集脚本或接口、时间戳或统计区间等元数据。
+4. 对仍待补证的内容，在“待补充信息”中列出缺失字段、建议的下一步核验动作及期望来源；不得凭空新增知识。
+
+## 输出结构
+保持以下章节顺序（无内容写“（无）”）：
+- 名词解释
+- 规范
+- 相关数据
+- 新闻事件
+- 论文参考
+- 示例
+- 其他知识
+- 未找到的信息
+- 方法与规范
+- 事件与案例
+- 已淘汰知识（含淘汰原因与原来源）
+
+    ## 约束
+    - 禁止使用“搜索结果1/引用2/来源A”等编号占位，必须写出真实来源并保持 UTF-8 编码。
+    - 若发言仅给出估计或尚未核验的判断，需标注“信息不足，以下为合理推测”并说明假设条件。
+    - 不得删除发言未提及且尚未核验的知识；所有调整必须由发言内容与既有知识共同支撑。
+
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
+- 不得讲与任务无关的行业故事。
+
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
+
+[[PROMPT-GUARD v1 END]]
+    """
+
+    user_prompt = f"""
+# 当前知识库
+```
+{history_know}
+```
+
+# 研究员发言
+```
+{role_answer}
+```
+
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
+- 不得讲与任务无关的行业故事。
+
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
+
+[[PROMPT-GUARD v1 END]]
+    """
+
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt,
+        user_prompt,
+        temperature=0.3,
+        no_search=True,
+        inner_search=True,
+    )
+
+    return answer.strip()

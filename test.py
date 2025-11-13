@@ -7,7 +7,7 @@ que1="""
 """
 
 que2="""
-   设计一个网络上没有的,预期用户群体较高的，且具有很高价值的智能体。
+设计一个网络上没有的,预期用户群体较高的，且具有很高价值的智能体。
 """
 
 que3="""
@@ -31,4 +31,4 @@ stream = AIStream()
 
 qwen_model = QwenModel(model_name="qwen-plus-latest")
 
-result_content = start_meeting(qwen_model,que1,stream)
+result_content = start_meeting(qwen_model,que3,stream)

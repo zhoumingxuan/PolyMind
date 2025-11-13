@@ -1,116 +1,156 @@
-import os, requests, json
-from datetime import datetime
 import time
+from typing import Dict, List, Tuple
+
+import requests
+
 from config import ConfigHelper
 
 config = ConfigHelper()
 
-cache_data=[]
-
-APPBUILDER_KEY=config.get("baidu_key", None)
-
-url = "https://qianfan.baidubce.com/v2/ai_search/chat/completions"
-headers = {
-    "Authorization": f"Bearer {APPBUILDER_KEY}",
-    "Content-Type": "application/json"
+RECENCY_HINT = {
+    "week": "最近7天",
+    "month": "最近30天",
+    "semiyear": "最近180天",
+    "year": "最近365天",
 }
 
-#当前日期
-date_str=datetime.today().strftime('%Y年%m月%d日')
 
-def web_search(search_message,search_recency_filter=None):
-   try:
-      time.sleep(10)
-      return inner_web_search(search_message,search_recency_filter=search_recency_filter)
-   except Exception as e:
-      time.sleep(180)
-      return inner_web_search(search_message,search_recency_filter=search_recency_filter)
+class SearchProviderError(RuntimeError):
+    """网络搜索提供方异常。"""
 
 
+class SearchProviderBase:
+    """所有搜索提供方的公共实现。"""
 
-def inner_web_search(search_message,search_recency_filter=None):
- 
- for record in cache_data:
-    if record.get("search_key") == search_message:
-        return record.get("content")
- 
- key=f"{search_message}\n\n{search_recency_filter}\n\n"
+    NAME = "base"
 
- body = {
-    "messages": [
-     {"role": "user", "content": search_message}
-    ],
-    "search_source": "baidu_search_v2",
-    "search_mode": "required",
-    "temperature":0.5,
-    "instruction": """
-# 搜索规范和要求（特别严格的强制性要求）
+    def __init__(self, cfg: ConfigHelper):
+        self.cfg = cfg
+        self._cache: Dict[str, Tuple[str, List[Dict]]] = {}
+        self.cooldown = float(cfg.get("search_cooldown", 1.0) or 1.0)
+        self.retry_delay = int(cfg.get("search_retry_delay", 30) or 30)
 
-  1. 网络搜索结果必须完全围绕搜索问题展开，不能涉及任何无关内容。
+    def _cache_key(self, question: str, time_filter: str) -> str:
+        return f"{question.strip()}|||{time_filter or 'none'}"
 
-  2. 结果中每个细节必须准确地呈现搜索到的信息，禁止使用概括性描述和泛泛而谈，确保描述精确且完整。
+    def _from_cache(self, question: str, time_filter: str):
+        key = self._cache_key(question, time_filter)
+        return self._cache.get(key)
 
-  3. 对搜索结果中的信息严禁篡改、虚构或夸大。所有信息必须忠实于搜索到的网络资料。
+    def _store_cache(self, question: str, time_filter: str, data):
+        key = self._cache_key(question, time_filter)
+        self._cache[key] = data
 
-  4. 严禁给出任何结论、建议或计划，严格只进行归纳整理，不添加任何分析或推测。
+    def search(self, question: str, time_filter: str = "none"):
+        """统一的外部调用入口，带缓存与简单退避。"""
+        cached = self._from_cache(question, time_filter)
+        if cached:
+            return cached
 
-  5. 每条信息后面必须明确标明来源，包括网站名和具体文章的链接。来源格式如下：
-     - 来源：网站名称，文章标题，链接（网址）
+        try:
+            result = self._search(question, time_filter)
+        except SearchProviderError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            time.sleep(self.retry_delay)
+            result = self._search(question, time_filter)
 
-  6. 不能虚构来源，确保每个来源都是真实可靠的，且能够追溯到具体的网页或文章。
+        self._store_cache(question, time_filter, result)
+        if self.cooldown:
+            time.sleep(self.cooldown)
+        return result
 
-  7. 涉及含有数据、统计信息、行业规范、法律法规等内容，必须明确标注时间信息，具体的时间点或具体的时间范围。
+    def _search(self, question: str, time_filter: str):
+        raise NotImplementedError
 
-  8. （特别强调）若是搜索结果为空，且模型自带的知识库中有相关信息，则来源必须标注为"大模型生成,存在幻觉请谨慎使用"和引用知识具体的时间。
-
-  9. （特别强调）若是搜索结果为空，且模型自带的知识库中也没有相关信息，则必须明确标注"搜索结果为空"。
-
-# 输出要求
-- 输出内容应保持简洁，确保信息无遗漏，并且准确反映网络搜索结果中的关键信息。
-- 每一条总结必须附带来源标注，格式统一，并包含准确的网页链接。
-- 禁止在输出中加入任何主观分析或不具备明确来源的内容。
-
-
-# 输出要求
-  
-  - 输出内容应保持简洁，确保信息无遗漏，并且准确反映网络搜索结果中的关键信息。
-  - 禁止在输出中加入任何主观分析或不具备明确来源的内容。
-
-    """,
-    "response_format":"text",
-    "enable_reasoning":True,
-    "enable_corner_markers":False,
-    "resource_type_filter": [{"type": "image","top_k": 5},{"type": "web", "top_k": 10}],
-    # 可选：指定摘要模型
-    "model": "DeepSeek-R1",
-    "stream": False          # 流式返回设 True
- }
- 
- if search_recency_filter and search_recency_filter in ['year','semiyear','week','month'] and search_recency_filter!="":
-    body['search_recency_filter']=search_recency_filter
- 
- resp = requests.post(url, headers=headers, json=body, timeout=1200).json()
+    @staticmethod
+    def _apply_recency_hint(question: str, time_filter: str) -> str:
+        if not time_filter or time_filter == "none":
+            return question
+        hint = RECENCY_HINT.get(time_filter, "")
+        if not hint:
+            return question
+        return f"{question}（限定{hint}范围）"
 
 
- while not resp.get("choices"):
-    print("Error:",resp)
-    time.sleep(180)
-    resp = requests.post(url, headers=headers, json=body, timeout=1200).json()
+class BaiduAISearchProvider(SearchProviderBase):
+    """百度千帆智能搜索适配实现。"""
 
- messages=[]
+    NAME = "baidu"
 
- references=[]
+    def __init__(self, cfg: ConfigHelper):
+        super().__init__(cfg)
+        self.api_key = cfg.get("baidu_key")
+        self.top_k = int(cfg.get("search_top_k", 6) or 6)
+        self.url = "https://qianfan.baidubce.com/v2/ai_search/chat/completions"
+        self.timeout = int(cfg.get("search_timeout", 1200) or 1200)
+        if not self.api_key:
+            raise SearchProviderError("缺少 Baidu AI Search 鉴权。")
 
- references.extend(resp.get("references", []))
+    def _search(self, question: str, time_filter: str):
+        query = self._apply_recency_hint(question, time_filter)
+        body = {
+            "messages": [{"role": "user", "content": query}],
+            "search_source": "baidu_search_v2",
+            "search_mode": "required",
+            "temperature": 0.4,
+            "instruction": (
+                "【任务】围绕查询问题逐条归纳检索结果，不得输出建议或计划。\n"
+                "【要求】\n"
+                "1. 每条信息都要给出准确来源（网站名称+文章标题+URL）。\n"
+                "2. 明确写出时间、地点、人物等关键要素，保持与原文一致。\n"
+                "3. 如果没有检索到结果，必须返回“搜索结果为空”。\n"
+                "4. 禁止补充主观推断或模型自带知识。"
+            ),
+            "response_format": "text",
+            "enable_reasoning": False,
+            "enable_corner_markers": False,
+            "resource_type_filter": [
+                {"type": "image", "top_k": 3},
+                {"type": "web", "top_k": max(self.top_k, 6)},
+            ],
+            "model": "DeepSeek-R1",
+            "stream": False,
+        }
 
- for item in resp["choices"]:
-    messages.append(item["message"]["content"])
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
 
- data="".join(messages)
+        response = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
+        response.raise_for_status()
+        payload = response.json()
 
- cache_data.append({
-    'search_key':key,
-    'content':data
- })
+        while not payload.get("choices"):
+            time.sleep(self.retry_delay)
+            response = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
+            response.raise_for_status()
+            payload = response.json()
 
- return data,references
+        messages = []
+        references = payload.get("references", [])
+        for item in payload.get("choices", []):
+            content = item.get("message", {}).get("content")
+            if content:
+                messages.append(content)
+
+        return "\n".join(messages), references
+
+
+def _build_provider() -> SearchProviderBase:
+    provider_name = (config.get("search_provider", "baidu") or "baidu").lower()
+    if provider_name not in ("baidu", ""):
+        raise SearchProviderError("当前仅支持 Baidu AI Search。")
+    return BaiduAISearchProvider(config)
+
+
+_PROVIDER = None
+
+
+def web_search(search_message: str, search_recency_filter: str = "none"):
+    """统一对外暴露的搜索调用。"""
+    global _PROVIDER  # pylint: disable=global-statement
+    if _PROVIDER is None:
+        _PROVIDER = _build_provider()
+    return _PROVIDER.search(search_message, search_recency_filter or "none")

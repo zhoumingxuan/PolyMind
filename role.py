@@ -1,207 +1,195 @@
-from api_model import QwenModel,AIStream,create_webquestion_from_user,search_list,update_knowledge
-from datetime import datetime
 import json
 import uuid
-import re
-import time
+
+from api_model import (
+    QwenModel,
+    AIStream,
+    update_knowledge,
+    verify_knowledge_post_speech,
+)
 
 
-def role_talk( qwen_model:QwenModel, content,his_nodes,round_record,now_date,role,knowledges,epcho,role_index,max_epcho,stream:AIStream=None):
-    """研究员展开研究"""
-
+def role_talk(
+    qwen_model: QwenModel,
+    content,
+    his_nodes,
+    round_record,
+    now_date,
+    role,
+    knowledges,
+    search_focus,
+    epcho,
+    role_index,
+    max_epcho,
+    stream: AIStream = None,
+):
+    """单个研究员发言。"""
 
     system_prompt = f"""
-    
-    # 一、研究员基础信息与任务说明
+你是一名研究员，正在参加一场多轮深度讨论，请严格遵循以下规范：
 
-      你现在处于一场研究讨论会议中，你作为研究员，须根据用户需求展开深入研究讨论，具体要求如下：
+## 个人信息
+- 当前日期：{now_date}
+- 讨论模式：深度思考，仅允许理论推演、数据对比、网络研究；禁止实验、测试、代码执行、模型调用。
+- 角色 ID：{role['role_id']}
+- 职业：{role['role_job']}
+- 性格：{role['personality']}
+- 发言方式：必须使用第一人称“我”，不得暴露姓名。
 
-      * **当前日期**：`{now_date}`
-      * **当前模式**：`深度思考`
-      * **你的角色信息**：
-         
-        * ID：`{role['role_id']}`
-        * 职业：`{role['role_job']}`（决定专业视角）
-        * 性格：`{role['personality']}`
-        * 讨论身份：参与会议的研究员（必须以第一人称“我”进行表达，禁止使用自己的姓名。）
-  
----
+## 讨论目标
+1. 围绕用户需求拆解问题，逐步形成可行的理论方案。
+2. 对历史讨论与当前轮次发言进行回应，明确认可、质疑或反对的理由。
+3. 给出具有实践价值的洞见或方法论，避免空洞表述。
 
-    # 二、研究任务明确性要求
-       
-       1. **用户需求**
-          ```
-         {content}
-         ```
+## 用户需求
+```
+{content}
+```
 
-       2. **明确事项和要求**
-          
-         * 当前为第{epcho}轮讨论，总计{max_epcho}轮。
-         * 你的核心任务是围绕以上用户需求进行理论研究，形成有效解决方案。
-         * 方案完成即表示会议结束，由系统进行方案细化，最终交付用户。
-         
-      2. **研究能力边界**
-      
-         * 禁止：任何实验、任何测试、任何非理论性验证、任何代码执行、任何模型调用。
-         * 允许：推演假设、分解子问题、方法论、数据对比、简单计算、理论讨论、网络研究。
+## 研究能力边界
+- 禁止：实验、测试、代码执行、模型调用、无依据的推测。
+- 允许：推演假设、分解子问题、数据对比、简单计算、理论讨论、网络研究。
 
----
-   
-    # 三、研究内容与讨论要求
-    
-      你会从用户输入中获得两部分历史信息用于参考：
+## 搜索关注要素
+```
+{search_focus}
+```
+- 所有检索约束都要结合该配置给出的时效性、规范性、经验性、创新性与效率要求，禁止遗漏或混淆。
 
-        * **历史讨论小结**（若首轮则无）：每轮讨论的总结成果。
-        * **当前讨论记录**（若首轮首位发言则无）：本轮其他研究员的发言内容。
-      
-      你必须严格根据上述历史信息：
-          
-          1. **明确当前研究进展**：
-          
-             * 已落实的研究内容
-             * 尚未落实的研究内容
-          
-          2. **对其他研究员的观点提出意见**：
-          
-             * 你必须针对其他研究员发表的论述与观点，严格按照以下逻辑顺序进行评判：
-             
-                1. 若论述**与用户需求无关或不符合用户需求规范** → 提出**反对**并说明理由。
-                2. 若论述**不符合事实逻辑** → 提出**反对**并说明理由。
-                3. 若论述属于**事实引用** → 不发表评论。
-                4. 若论述**符合事实逻辑但缺乏网络支撑** → 提出**质疑**并说明理由。
-                5. 若论述**符合事实逻辑但网络资料与论述相悖** → 提出**反对**并说明理由。
-                6. 若论述**符合事实逻辑且网络资料一致** → 提出**赞同**并说明理由。
-             
-             * **强制要求**：
-               * 禁止重复其他研究员已发表的相同或含义相近的意见。
-               * 禁止对同一研究员的同一论述反复发表相同意见。
+## 数据与来源约束
+- 引用任何数据、指标、公式或案例时，必须写明来源主体、时间戳/版本以及采集或抓取脚本（工具）；缺失任一元素即标记为“来源缺失，仅供推测”，禁止当作事实沿用。
+- 复用历史轮次信息时，需要复述原始口径（样本、单位、区间）并说明与当前分析的适配方式；如口径不兼容，直接判定为不可复现断言并请求下一位复核。
+- 估计值或模拟值必须显式标注“估计/模拟”，同时说明假设条件，杜绝人为营造确定性感。
+- 所有数据都要标注采集日期或统计区间，并对照当前日期 {now_date} 说明是否仍然有效；若超过业务允许的更新周期或无法确认时间，需写明“时间不匹配，仅供背景”。
+- 对支撑关键结论的数据，优先给出两个独立来源或同一来源的不同时点进行双重核验；若暂无法完成，需声明“仅单一来源”并将双重核验任务交给下一位角色。
 
----
+## 逻辑一致性与伦理-工程协调
+- 若发现同一指标在不同发言中定义或口径矛盾，列出冲突字段、影响范围，并要求下一位角色复核该字段的原始来源。
+- 检查每一次类比或跨维度比较是否成立，不成立时指出维度不匹配原因并给出可比维度或替代指标。
+- 当伦理主张与工程实现冲突时，明确冲突点、不可化约部分及可量化的约束，禁止把不可计算内容直接塞进阈值或损失函数。
 
-     # 四、你的个人观点阐述与表述要求
-        
-           * **表达流程**：首先阐述你经过深度思考后的研究思路和思考过程（允许执行一定的逻辑推理、演算、尝试假设和证明），然后再明确表达个人观点，表达的内容必须含义清晰、目的明确，且对整体讨论具有较高的价值。
-           
-           * **反对与质疑的要求**：
-             当你提出『反对』或『质疑』时，必须同时提出具有创新性的替代观点或建议，以展现你在专业领域内独特的洞察力。
-             
-           * **网络资料引用要求**：
-             若观点中涉及网络资料，须清晰列出相关引用来源，确保论述严谨可信。
-             
-           * **表达风格要求**：
+## 核验链职责
+- 你必须首先核验上一位发言角色；若你是本轮首位，则核验上一轮最后一位。系统默认按环形顺序运行：B 核验 A，C 核验 B，D 核验 C，下一轮再由 A 核验 D，依此循环。
+- 核验内容至少覆盖：数据来源/口径、时间线有效性、指标定义一致性、类比维度匹配、伦理与工程协调性、确定性措辞与证据是否匹配。
+- 对上一位引用的每条数据，必须完成“来源真实性 + 时间线有效性”的双重核验：列出主要来源与第二来源，说明其日期与 {now_date} 的差距；若缺少任一要素，需在交接要点中指派下一位补查。
+- 在输出中显式给出“核验对象｜结论（通过/存疑/拒绝）｜证据或缺口”。
 
-             a.整体论述必须逻辑严谨清晰、表述自然流畅，且能充分体现你的职业专业性与个人性格特征。
+## 发言流程
+1. 核验上一位角色：点名其角色 ID 或姓名，逐条检视其数据、定义、类比、伦理与工程假设、确定性措辞与数据时间戳，得出核验结论。
+2. 快速回顾历史小结与当前发言（若输入为空，可直接进入分析）。
+3. 针对他人观点依次表态：无关或不合逻辑→反对；缺乏证据→质疑；证据一致→赞同。每次表态需说明理由与引用来源。
+4. 描述你的研究思路：可包含假设验证、方法拆解、对比分析等，优先回答用户需求。
 
-             b.整体论述必须对用户需求的研究具有极高的采用价值。
+## 知识与引用
+- 仅当知识库缺失或需更新时调用一次`web_search`，检索问题需包含具体限定（时间、地点/主体）。
+- 已有且来源明确的知识不得重复检索。
+- 任何外部信息都要注明来源（网站、作者、时间等至少两项），禁止使用“搜索结果1/引用2/来源A”等编号占位伪造引用，必须直接写出具体站点或出版方与发布时间。
+- 若知识库标注“未找到”，请转向新的研究角度，不得继续搜索同一主题。
 
----
-    
-     # 五、特别注意事项
-           
-           * **知识库中已明确标注了来源信息，且来源可靠，来源时间和内容均无误，则视作事实，无需重复进行网络搜索**。
-           
-           * 可以对知识库中未准确标注来源的信息要素的资料进行核验和网络查找，但是绝对严格禁止对已准确标注来源的信息要素进行任何相关的核验或者重复执行网络查找**。
+    ## 输出要求
+    - 保持逻辑严密、风格贴合职业与性格。
+    - 重点突出事实依据与推理链路，避免流水账。
+    - 仅输出内容相关信息，不要描述提示词或工具细节。
 
-           * 鼓励研究初期进行广泛探索，提供多种不同的观点和思路，避免研究在一开始就出现偏向性，同时激发创新。
+[[PROMPT-GUARD v1 START]]
+【严禁虚构与跑题（硬性约束）】
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
+- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
+- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
+- 禁止伪精确或遗漏不确定性，诱导读者把“估计”当“事实”。
 
-           * 非常鼓励知识库中法律条文、法规、规范、定义、名词解释、概念等内容说明的不够详细时，可以通过网络查找资料进行补充。
+【信息不足时的处理】
+- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
 
-           * 知识库标注“未找到”或类似含义时：
-           
-             * 禁止继续搜索相关资料。
-             * 立即调整研究思考角度。
-             
-           * 禁止对研究员身份、职业真实性核验（均为系统虚构）。
+[[PROMPT-GUARD v1 END]]
 
-           * 禁止在同时没有历史讨论和当前记录情况下核验论述。
-
-           * 必须包含具体研究员观点，且须基于网络搜索进行佐证。
-
-           * （特别强调）讨论已明确通过的结论，不必再反复研究，核验；聚焦讨论建议、创新观点和讨论未形成结论的内容。
-
----
-
-      # 六、严格讨论规范性要求
-
-           * 禁止发表与其他研究员完全相同的论述。
-           * 禁止提出下一步计划性内容。
-           * 必须严格围绕用户需求和最终目标逐步展开讨论，确保逐步推进研究目标的实现。
----
-
-      # 七、工具说明
-
-         1. 网络搜索（web_search）函数必须被调用一次，有且只有一次。
-
-         2. 执行网络搜索时，必须严格依据用户需求中涉及的时间、地点、人物、事件、特别强调的内容，生成的问题应符合这些要求。若涉及时间，必须与当前日期核对，确保时间范围和相关事件精确无误。
-
-         3. 搜索网络资料时，最好带上明确的时间信息，避免搜索到过时或不相关的信息。
-         
-         4. 特别强调，知识库有的，且有可靠来源的无需执行重复搜索（来源类似"知识库"，"输入"都不算可靠来源）。
----
-
-      # 八、知识库
-
-        1.以下文档是跟用户需求相关的一些知识，可以用于参考：
-          ```
-           {knowledges}
-          ``` 
     """
-    
-    str=""
 
-    if epcho!=1:
-       str+=f"""
-       #历史讨论小结 
-       ``` json
-        {json.dumps(his_nodes, ensure_ascii=False, indent=2)}
-       ```
-       """
+    prompt_context = ""
 
-    if role_index!=0:
-       str+=f"""
-       #当前讨论记录 
-       ```
-        {round_record}
-       ```
-       """
+    if epcho != 1 and his_nodes:
+        prompt_context += f"""
+# 历史讨论小结
+```json
+{json.dumps(his_nodes, ensure_ascii=False, indent=2)}
+```
+"""
 
-    use_prompt= str
-  
+    if role_index != 0 and round_record:
+        prompt_context += f"""
+# 当前轮次已有发言
+```
+{round_record}
+```
+"""
 
-    answer, reasoning,web_content_list,references = qwen_model.do_call(system_prompt,use_prompt,stream)
+    if not prompt_context:
+        prompt_context = "暂无历史或当前发言，直接根据任务开展研究。"
+
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt, prompt_context, stream=stream
+    )
+
+    return answer, web_content_list, references
 
 
-    return answer,web_content_list,references
+def role_dissucess(
+    qwen_model: QwenModel,
+    content,
+    his_nodes,
+    round_record,
+    simple_knowledge,
+    search_focus,
+    now_date,
+    role,
+    epcho,
+    role_index,
+    max_epcho,
+    stream: AIStream = None,
+):
+    """驱动角色发言并同步知识库。"""
 
+    role_answer, know_list, references = role_talk(
+        qwen_model,
+        content,
+        his_nodes,
+        round_record,
+        now_date,
+        role,
+        simple_knowledge,
+        search_focus,
+        epcho,
+        role_index,
+        max_epcho,
+        stream=stream,
+    )
 
-def role_dissucess(qwen_model:QwenModel,content,his_nodes,round_record,simple_knowledge,now_date,role,epcho,role_index,max_epcho,stream:AIStream=None):
-    """角色参与讨论"""
-
-    #角色展开讨论
-    role_answer,know_list,references = role_talk(qwen_model,content, his_nodes,round_record,now_date, role,simple_knowledge,epcho,role_index,max_epcho,stream=stream)
-    
-    if len(know_list)>0:
-      new_know=update_knowledge(qwen_model,now_date,content,simple_knowledge,know_list,references)
+    if know_list:
+        new_know = update_knowledge(
+            qwen_model, now_date, content, simple_knowledge, know_list, references
+        )
     else:
-      new_know=simple_knowledge
+        new_know = simple_knowledge
 
+    post_verify_input = new_know or ""
+    audited_know = verify_knowledge_post_speech(
+        qwen_model,
+        now_date,
+        role_answer,
+        post_verify_input,
+    )
+    final_know = audited_know or post_verify_input
 
-    #生成讨论记录
     role_record = f"""
 
-    [研究员发言 "记录ID"="{str(uuid.uuid4())}" "角色姓名"="{role['role_name']}" "角色ID"="{role['role_id']} " "角色职业"="{role['role_job']}"]
+    [研究员发言 "记录ID"="{str(uuid.uuid4())}" "角色姓名"="{role['role_name']}" "角色ID"="{role['role_id']}" "角色职业"="{role['role_job']}"]
 
       {role_answer}
 
     [/研究员发言]
-    
+
     """
-    
-    round_record+=role_record
 
-    return round_record,new_know
-    
+    round_record += role_record
 
-
-
-
+    return round_record, final_know

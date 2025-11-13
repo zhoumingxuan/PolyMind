@@ -1,6 +1,13 @@
 {
     "max_epcho": 5,
-    "role_count": 5, 
-    "baidu_key":"",
-    "qwen_key":""
+    "role_count": 5,
+    "qwen_key": "",
+    "baidu_key": "",
+    "search_provider": "baidu",
+    "dashscope_search_api_key": "",
+    "dashscope_search_app_id": "",
+    "dashscope_search_app_version": "beta",
+    "dashscope_search_endpoint": "https://dashscope.aliyuncs.com/api/v2/apps/deep-search-agent/chat/completions",
+    "search_top_k": 6,
+    "search_timeout": 120
 }
