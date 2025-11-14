@@ -349,15 +349,14 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
 
         sugg_text, can_end, sections_to_prune = summary_sugg(
             qwen_model,
-            content,
+            user_need_profile,
             now_date,
             msg_content,
             his_nodes,
             know_data,
             epcho,
             MAX_EPCHO,
-            search_focus,
-            user_need_profile,
+            search_focus
         )
 
         last_content = f"""
@@ -425,7 +424,7 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
 
 def summary_sugg(
     qwen_model: QwenModel,
-    content,
+    user_need_profile,
     now_date,
     round_record_message,
     his_nodes,
@@ -433,65 +432,78 @@ def summary_sugg(
     epcho,
     max_epcho,
     search_focus,
-    user_need_profile,
     stream: AIStream = None,
 ):
     """生成当前讨论进度、核验结果及下一步建议。"""
 
-    verification_schema = """```
-{
-  "approvedContent": "有序列表 Markdown",
-  "pendingContent": "有序列表 Markdown",
-  "nextStepsContent": "如需继续讨论时的建议",
-  "canEndMeeting": false,
-  "verificationChecklist": [
-    {
-      "topicGroup": "approved|pending",
-      "topicTitle": "议题标题",
-      "question": "具体检索问题",
-      "time": "week|month|semiyear|year|none",
-      "status": "verified|disputed|pending",
-      "evidenceSummary": "依据摘要，说明结论是否成立",
-      "sourceCitations": [
-        {
-          "title": "文章或网页标题",
-          "author": "作者或机构",
-          "publishedAt": "时间",
-          "url": "链接"
-        }
-      ],
-      "pruneSnippet": "若需从知识库移除的原文句子，没有则留空"
-    }
-  ],
-  "sectionsToPrune": ["知识库中需删除的片段，可为空"]
-}
-```"""
 
     system_prompt = f"""
-你正在跟踪一次多轮研究讨论，需要基于输入信息给出进展评估并完成证据核验。
+你正在跟踪理论研究讨论，需要基于输入信息完成进展评估并完成证据核验。
 
 ## 基本信息
 - 当前日期：{now_date}
 - 当前轮次：第{epcho}轮 / 共 {max_epcho} 轮
-- 模式：理论研究，禁止实验、测试、代码执行。
+- 模式：仅限于根据已有的相关资料进行理论研究（禁止实验、测试、代码执行、组织会议、外部程序调用）
 - 检索关注要素：所有判断需符合下方配置，必要时提醒研究员遵守对应的时效性、规范性、经验性、创新性、效率性等级。
 
 ```
 {search_focus}
 ```
 
-## 核验与搜索要求
-1. 先根据讨论内容判定“已通过结论”与“仍待结论”的议题。
-2. 针对两类议题分别生成 1~4 条高质量检索问题（question_list），合并为一次 `web_search` 调用；禁止重复或含糊问题。
-3. 核验结果需说明：
-   - 检索问题
-   - 证据结论（通过 / 存疑 / 待定）
-   - 主要来源（标题、作者或机构、时间、链接）
-   - 是否需要从知识库剔除对应片段
-4. 若无法获取有效结果，需在 checklist 中写明“来源不足”和下一步计划。
+## 用户需求解读
+```
+{user_need_profile}
+```
+- 若解读中包含用户提供的既有知识、数据或研究方向，可视为待核验的可靠线索，允许引用；但最终结论仍需写明来源或在 checklist 中安排核验。
 
-## 输出 JSON 结构（仅输出 JSON）：
-{verification_schema}
+## 网络搜索工具说明
+- 必须先至少 5 条高质量问题，通过一次 `web_search` 调用批量执行检索；禁止多次零散调用。
+- 每个问题需写明时间范围、地域/主体与关键限制，避免语义重叠。
+
+
+## 任务
+1. 解析“本轮讨论概要”中的数据引用、观点来源或争议点，并转换为 question_list 交由 `web_search` 核验。
+2. 检索完成后，对议题进行如下分类：
+   a. 讨论已达成一致的信息，且检索确认可追溯来源（或属行业通用共识）→ “已核验的依据”。
+   b. 讨论已达成一致的信息，但无法确认可靠来源，也不属约定俗成 → “被否决的依据”。
+   c. 讨论存在争议的信息，但检索提供了可信证据，可据此统一口径 → “已核验的依据”。
+   d. 讨论存在争议的信息，且不满足以上**(a,b,c点)**，则统一视作“被否决的依据”。
+   e. 讨论中，若研究员存在讨论偏离用户需求，必须明确指出（具体到哪位研究员，哪部分的表述），无论任何场景下，直接视作“被否决的结论”。
+   f. 讨论中，基于“已核验的依据”且绝对不包含“被否决的依据”推演所得的观点，达成共识并且逻辑合理，校验通过，则视作“已通过结论”。
+   g. 讨论中，基于“已核验的依据”且绝对不包含“被否决的依据”推演所得的观点，逻辑合理且校验通过，但并未达成共识，则视作“仍待讨论的议题”，并说明论据已核验。
+   h. 讨论中，不满足以上**(e,f,g点)**，则统一视作“被否决的结论”。
+
+3. 基于上述三类结果，以及用户需求解读和历史讨论概要，给出下一阶段的讨论规划，原则上规划需要使得研究能够更有进展，禁止笼统表述。
+
+## 特别郑重声明
+   1.知识库仅用于需要剔除哪些知识点的比对，绝对禁止用于上述任务的核验，无论任何场景都绝对禁止；但仅限于该处核验的情况，故此不必在描述中声明这个要求。
+   2.核验时必须调用`web_search`,绝对禁止自我欺骗式认为调用过。
+   3.已有知识库并不能覆盖所有知识，仅能作为帮助理解课题的知识库存在，故此必须调用网络搜索工具进行查找。
+
+## 输出要求
+   1.输出包含六部分内容：
+       a.已核验的依据 (字段：verifiedBasis，字符串格式)
+       b.被否决的依据 (字段：rejectBasis，字符串格式)
+       c.已通过结论 (字段：approvedContent，字符串格式)
+       d.被否决的结论 (字段：rejectContent，字符串格式)
+       e.仍待讨论议题 (字段：pendingContent，字符串格式)
+       f.是否可以结束讨论 (字段：canEndMeeting，布尔值格式)
+       g.下一阶段的讨论规划(若可结束讨论，则无需此规划) (字段：nextStepsContent，字符串格式)
+       h.知识库需要剔除的内容（知识库中，存在和被否决的结论类似的信息，需一一列举） (字段：sectionsToPrune,字符串数组格式)
+
+   2.输出 JSON 结构（仅输出 JSON），请严格遵循以下格式输出：
+       ```json
+       {{
+            "verifiedBasis":"",
+            "rejectBasis":"",
+            "approvedContent":"",
+            "rejectContent":"",
+            "pendingContent":"",
+            "canEndMeeting":false,
+            "nextStepsContent":"",
+            "sectionsToPrune":[[]]
+       }}
+       ```
 
 [[PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
@@ -503,6 +515,7 @@ def summary_sugg(
     """
 
     user_prompt = f"""
+
 # 用户需求解读
 ```
 {user_need_profile}
@@ -523,11 +536,8 @@ def summary_sugg(
 {knowledge_snapshot}
 ```
 
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】与上方一致。
-【信息不足时的处理】与上方一致。
-[[PROMPT-GUARD v1 END]]
     """
+
 
     answer, reasoning, web_content_list, references = qwen_model.do_call(
         system_prompt, user_prompt, stream=stream, no_search=False
@@ -543,41 +553,48 @@ def summary_sugg(
         json_data = json.loads(normalized)
     except json.JSONDecodeError:
         return answer.strip(), False, []
-
-    verification_checklist = json_data.get("verificationChecklist", []) or []
-    sections_to_prune = json_data.get("sectionsToPrune", []) or []
-
+    
+    verified_basis = json_data.get("verifiedBasis", "- （无）")
+    reject_basis = json_data.get("rejectBasis", "- （无）")
     approved_section = json_data.get("approvedContent", "- （无）")
+    reject_section = json_data.get("rejectContent", "- （无）")
     pending_section = json_data.get("pendingContent", "- （无）")
     next_steps = json_data.get("nextStepsContent", "- （未提供）")
-
-    verified_report = format_verification_section(verification_checklist, "approved")
-    pending_report = format_verification_section(verification_checklist, "pending")
+    sections_to_prune = json_data.get("sectionsToPrune", []) or []
+    canEndMeeting = json_data.get("canEndMeeting", False)
 
     long_content = f"""
-    ## 讨论已明确通过的结论
+## 已核验的依据
+   
+   {verified_basis}
 
-    {approved_section}
+##  被否决的依据
+   
+   {reject_basis}
 
-    ### 证据核验（已通过议题）
-    {verified_report}
+## 讨论已明确通过的结论
+   
+   {approved_section}
 
-    ## 仍未形成结论的议题
+## 讨论被否决的结论
+   
+   {reject_section}
 
-    {pending_section}
+## 仍待讨论议题
+   
+   {pending_section}
 
-    ### 证据核验（待定议题）
-    {pending_report}
-    """.strip()
+""".strip()
 
-    if not json_data.get("canEndMeeting", False):
+    if not canEndMeeting:
         long_content += f"""
 
     ## 下一步讨论建议
     {next_steps}
     """
 
-    return long_content, json_data.get("canEndMeeting", False), sections_to_prune
+    return long_content, canEndMeeting, sections_to_prune
+
 
 def summary_round(
     qwen_model: QwenModel,
@@ -668,23 +685,22 @@ def summary(
 
 ## 基本信息
 - 当前日期：{now_date}
-- 用户需求：
-```
-{dt_content}
-```
 - 检索关注要素：所有最终结论都要说明如何满足下方约束，必要时提示残留风险。
 ```
 {search_focus}
 ```
- - 用户需求解读：请确保交付形式、目标、细节关注点与下方解析保持一致。
-```
-{user_need_profile}
-```
 
-    ## 任务
-    1. 综合每轮讨论概要，提炼核心结论、关键数据、分歧点。
-    2. 必须调用 web_search 工具（仅一次）以补充必要的最新事实，并在总结中引用。
-    3. 若出现创新概念或专有名词，需单独成段解释。
+## 任务
+1. 综合每轮讨论概要，提炼核心结论、关键数据、分歧点。
+2. 必须调用 web_search 工具（仅一次）以补充必要的最新事实，并在总结中引用。
+3. 若出现创新概念或专有名词，需单独成段解释。
+
+## 网络搜索工具说明
+- 必须先至少 3 条高质量问题，通过一次 `web_search` 调用批量执行检索；禁止多次零散调用。
+- 每个问题需写明时间范围、地域/主体与关键限制，避免语义重叠。
+
+## 特别郑重声明
+1.已有知识库并不能覆盖所有知识，仅能作为帮助理解课题的知识库存在，故此必须调用网络搜索工具进行查找。
 
 [[PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
@@ -702,6 +718,7 @@ def summary(
     ## 输出格式
 - 使用 Markdown，结构清晰。
 - 必须包含：
+  - 研究报告的标题
   - 用户需求解读
   - 会议总体结论
   - 关键依据（可分条列出）
@@ -740,7 +757,7 @@ def summary(
 """
 
     answer, reasoning, web_search_list, references = qwen_model.do_call(
-        system_prompt, user_prompt, stream=stream
+        system_prompt, user_prompt, stream=stream,no_search=False
     )
 
     return answer

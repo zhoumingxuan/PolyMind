@@ -148,6 +148,8 @@ class QwenModel:
 
         time.sleep(5)
 
+        tools_data=None if no_search else self.tools
+
         while True:
             response = None
             while response is None:
@@ -160,7 +162,7 @@ class QwenModel:
                         max_tokens=1024 * 16,
                         thinking_budget=1024 * 32,
                         enable_thinking=True,
-                        tools=None if no_search else self.tools,
+                        tools=tools_data,
                         enable_search=True if inner_search else False,  # 开启联网搜索的参数
                         search_options={
                             "forced_search": True,  # 强制开启联网搜索
@@ -265,7 +267,7 @@ class QwenModel:
         stream: AIStream = None,
         temperature: float = 0.5,
         no_search: bool = False,
-        inner_search: bool = True,
+        inner_search: bool = False,
         result_format: str = "message",
     ):
         messages = [
