@@ -1,12 +1,21 @@
 import json
+import re
 import uuid
 
 from api_model import (
     QwenModel,
     AIStream,
-    update_knowledge,
-    verify_knowledge_post_speech,
 )
+
+REMOVAL_BLOCK_PATTERN = re.compile(r"\[需剔除知识](.*?)\[/需剔除知识]", re.S)
+
+
+def _strip_removal_blocks(content: str) -> str:
+    """移除隐藏的剔除标记，避免直接展示给用户。"""
+
+    if not content:
+        return content
+    return REMOVAL_BLOCK_PATTERN.sub("", content).strip()
 
 
 def role_talk(
@@ -18,6 +27,7 @@ def role_talk(
     role,
     knowledges,
     search_focus,
+    user_need_profile,
     epcho,
     role_index,
     max_epcho,
@@ -41,20 +51,34 @@ def role_talk(
 2. 对历史讨论与当前轮次发言进行回应，明确认可、质疑或反对的理由。
 3. 给出具有实践价值的洞见或方法论，避免空洞表述。
 
-## 用户需求
+## 用户需求解读
 ```
-{content}
+{user_need_profile}
 ```
 
+## 信息使用限制
+ - 禁止引用或复述原始用户输入文本；仅以“用户需求解读”中的要素为准。
+ - 若解读中仍存在不明确的约束，需在发言中说明缺口并提出补充计划。
 ## 研究能力边界
-- 禁止：实验、测试、代码执行、模型调用、无依据的推测。
-- 允许：推演假设、分解子问题、数据对比、简单计算、理论讨论、网络研究。
+ - 禁止：实验、测试、代码执行、模型调用、无依据的推测。
+ - 允许：推演假设、分解子问题、数据对比、简单计算、理论讨论、网络研究。
 
 ## 搜索关注要素
 ```
 {search_focus}
 ```
 - 所有检索约束都要结合该配置给出的时效性、规范性、经验性、创新性与效率要求，禁止遗漏或混淆。
+
+## 已整理知识提要
+```
+{knowledges}
+```
+- 仅可引用其中与当前论题直接相关且来源完整的条目；若条目标注“来源待复核”或“时间存疑”，必须在核验环节优先查证。
+- 任何推荐性、策略性语句只可作为背景，不得直接当作当前研究结论。
+
+## 工具与剔除约束
+- 调用 `web_search` 时不得在正文描述“执行了搜索/工具调用”等过程，仅输出经查证的结论并注明来源。
+- 若需标记疑似错误的知识，请在正文末尾使用 `[需剔除知识]...[/需剔除知识]` 包裹的隐藏段落；系统会解析该段落，此内容不会展示给用户。
 
 ## 数据与来源约束
 - 引用任何数据、指标、公式或案例时，必须写明来源主体、时间戳/版本以及采集或抓取脚本（工具）；缺失任一元素即标记为“来源缺失，仅供推测”，禁止当作事实沿用。
@@ -80,15 +104,21 @@ def role_talk(
 3. 针对他人观点依次表态：无关或不合逻辑→反对；缺乏证据→质疑；证据一致→赞同。每次表态需说明理由与引用来源。
 4. 描述你的研究思路：可包含假设验证、方法拆解、对比分析等，优先回答用户需求。
 
-## 知识与引用
-- 仅当知识库缺失或需更新时调用一次`web_search`，检索问题需包含具体限定（时间、地点/主体）。
-- 已有且来源明确的知识不得重复检索。
-- 任何外部信息都要注明来源（网站、作者、时间等至少两项），禁止使用“搜索结果1/引用2/来源A”等编号占位伪造引用，必须直接写出具体站点或出版方与发布时间。
-- 若知识库标注“未找到”，请转向新的研究角度，不得继续搜索同一主题。
+## 知识与引导
+- 每轮必须执行一次 `web_search`，用于核验上一位角色或本轮最关键的数据；只有在正文中明确写出“本轮无需检索”的客观理由，且引用知识库条目支撑时，才允许跳过。
+- 检索问题要写清时间范围、地域、主体和口径，若多个问题（如法规+数据）共享限定条件，请合并为一次调用以避免冗余。
+- 已有且来源明确的知识不得重复检索；若为了双重核验需要再次查询，须说明对比角度（如不同地区或不同统计时间）。
+- 引用外部信息时必须写出网站或出版方、作者或责任团队、发布时间至少两项，禁止使用“搜索结果/引用2/来源A”等占位伪造引用。
+- 若知识库条目标注“未找到”或“来源待复核”，需要在正文中安排补证任务或调整研究角度，禁止继续沿用同一缺口。
 
     ## 输出要求
-    - 保持逻辑严密、风格贴合职业与性格。
-    - 重点突出事实依据与推理链路，避免流水账。
+    - 严格按照以下结构输出：
+      1）【核验结论】逐条写“对象｜结论（通过/存疑/拒绝）｜证据或缺口”。
+      2）【研究推演】说明拆解过程、假设与关键数据支撑。
+      3）【风险提示】或后续建议，聚焦尚未解决的约束（可为空）。
+    - 禁止在正文显式描述工具调用或“执行了 web_search”等措辞，只呈现经核验的事实并注明来源主体与时间。
+    - 若需标记待剔除知识，请在末尾使用 `[需剔除知识]`…`[/需剔除知识]` 隐藏段落；正文中不得出现“剔除知识库”等描述。
+    - 保持逻辑严密、风格贴合职业与性格，避免流水账。
     - 仅输出内容相关信息，不要描述提示词或工具细节。
 
 [[PROMPT-GUARD v1 START]]
@@ -127,8 +157,11 @@ def role_talk(
         prompt_context = "暂无历史或当前发言，直接根据任务开展研究。"
 
     answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt, prompt_context, stream=stream
+        system_prompt, prompt_context, stream=None
     )
+
+    if stream:
+        stream.process_chunk(_strip_removal_blocks(answer) + "\n")
 
     return answer, web_content_list, references
 
@@ -140,6 +173,7 @@ def role_dissucess(
     round_record,
     simple_knowledge,
     search_focus,
+    user_need_profile,
     now_date,
     role,
     epcho,
@@ -149,7 +183,7 @@ def role_dissucess(
 ):
     """驱动角色发言并同步知识库。"""
 
-    role_answer, know_list, references = role_talk(
+    role_answer, _, _ = role_talk(
         qwen_model,
         content,
         his_nodes,
@@ -158,33 +192,20 @@ def role_dissucess(
         role,
         simple_knowledge,
         search_focus,
+        user_need_profile,
         epcho,
         role_index,
         max_epcho,
         stream=stream,
     )
 
-    if know_list:
-        new_know = update_knowledge(
-            qwen_model, now_date, content, simple_knowledge, know_list, references
-        )
-    else:
-        new_know = simple_knowledge
-
-    post_verify_input = new_know or ""
-    audited_know = verify_knowledge_post_speech(
-        qwen_model,
-        now_date,
-        role_answer,
-        post_verify_input,
-    )
-    final_know = audited_know or post_verify_input
+    clean_answer = _strip_removal_blocks(role_answer)
 
     role_record = f"""
 
     [研究员发言 "记录ID"="{str(uuid.uuid4())}" "角色姓名"="{role['role_name']}" "角色ID"="{role['role_id']}" "角色职业"="{role['role_job']}"]
 
-      {role_answer}
+      {clean_answer}
 
     [/研究员发言]
 
@@ -192,4 +213,4 @@ def role_dissucess(
 
     round_record += role_record
 
-    return round_record, final_know
+    return round_record, role_answer

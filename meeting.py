@@ -109,10 +109,33 @@ def create_roles(qwen_model: QwenModel, content, knowledges, stream=None):
 
 
 def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content):
-    """整理初始知识库。"""
+    """整理初始知识库并生成统一检索策略与需求解读。"""
+
+    structure_example = """```
+{
+  "knowledgeBase": "Markdown 结构化内容，突出概念、定义、法规、现状数据与案例",
+  "userNeedInsights": {
+    "targetDeliverable": "用户期望的交付形态，例如《xx对比报告》",
+    "coreObjectives": ["目标1", "目标2"],
+    "detailConstraints": ["必须回答的细节、指标口径、量化要求"],
+    "givenEvidence": ["用户提供的既有知识或数据来源（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
+    "researchAngles": ["用户指定的参考方向/方法/范围/比较维度（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
+    "riskAlerts": ["潜在争议或限制"]
+  },
+  "searchFocusProfile": {
+    "timeliness": {"level": "高", "reason": "说明原因"},
+    "compliance": {"level": "中", "reason": "说明原因"},
+    "experience": {"level": "低", "reason": "说明原因"},
+    "innovation": {"level": "中", "reason": "说明原因"},
+    "efficiency": {"level": "高", "reason": "说明原因"},
+    "extraNotes": ["提醒1", "提醒2"]
+  },
+  "removalHints": ["需要剔除的原文句子，可为空数组"]
+}
+```"""
 
     system_prompt = f"""
-你是资料整理员，负责将最新网络结果转化为结构化知识。
+你是资料整理与需求解读专家，需要把最新检索结果沉淀为可复核的知识基线，并同步输出检索策略与交付预期。
 
 ## 当前日期
 - {now_date}
@@ -122,19 +145,34 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
 {user_content}
 ```
 
-    ## 任务
-    1. 审核输入材料的来源与时间，只保留与需求相关且可追溯的数据。
-    2. 用 Markdown 列表整理背景、定义、法规要点、现状数据等信息，保留关键细节。
-    3. 如发现信息缺口，可在备注中提出仍需补充的方向，但本阶段禁止输出解决方案。
-    4. 每条知识必须至少包含两个独立来源（站点/出版方、作者或责任团队、链接、发布时间），若暂缺第二来源，标记“来源待复核”并说明原因。
-    5. 所有数据都要注明采集日期或统计区间，并与当前日期 {now_date} 对比说明是否仍然有效；若超过行业允许的更新周期或无法确认时间，需追加“【时间存疑，仅供背景】”标签。
-    6. 禁止使用“搜索结果1/引用2/来源A”等编号占位伪装来源，必须直接写出真实站点或出版方、作者或责任团队、发布时间以及所用采集脚本或接口信息。
+## 知识基线分栏要求
+- **指标与规范定义**：逐条写明指标名称、口径、计算方法、适用场景与来源时间，杜绝混用。
+- **监管 / 行业约束**：法规、标准、政策条款，注明发布机构与生效时间。
+- **现状数据与趋势**：仅保留帮助理解问题的数据，写清采集区间、单位、来源脚本或接口。
+- **典型案例 / 风险**：概述事实、相关主体与时间，说明对本课题的启示或争议。
+- **待补充信息**：列出仍未知但必须查证的字段。
+- 禁止写“推荐/建议/方案/行动计划”等指令性内容，基础知识库只保留理解所需的事实与概念。
+
+## 工作内容
+1. 过滤掉所有主观推断、推荐与无法追溯的描述，仅保留能让后续模型理解问题的背景、定义与事实。
+2. 细致拆解用户需求：除了交付形式、目标、细节，还需记录用户已给出的知识、引用、研究方向或假设，保证 `userNeedInsights` 足够支撑后续讨论而无需再引用原始需求。
+3. 基于知识缺口给出 `searchFocusProfile`，说明检索维度的优先级，并提出额外提醒（如“必须补全日期”）。
+4. 若检索结果中存在被证伪或口径冲突的内容，写入 `removalHints`，用于后续剔除。
+
+## 输出结构
+严格输出 UTF-8 JSON（不可包含反引号），参考下方示例：
+{structure_example}
+
+## 数据约束
+- 严禁编造来源、作者、年份、DOI、百分比、公司名称等“看似真实”的细节，禁止伪造工具调用记录。
+- 若证据不足，使用“信息不足，以下为合理推测”，并说明假设条件。
+- 不得引用与任务无关的故事或推荐性结论。
 
 [[PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
 - 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
+- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
 - 不得讲与任务无关的行业故事。
 
 【信息不足时的处理】
@@ -156,9 +194,9 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
 
 [[PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业A/B 数据、公司名称等“看似真实”的细节。
 - 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
+- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
 - 不得讲与任务无关的行业故事。
 
 【信息不足时的处理】
@@ -171,113 +209,105 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
         system_prompt, user_prompt, no_search=True, inner_search=True
     )
 
-    focus_profile = build_search_focus_profile(
-        qwen_model, now_date, user_content, answer
-    )
-
-    return answer, focus_profile
-
-
-def build_search_focus_profile(
-    qwen_model: QwenModel, now_date, user_content, knowledge_outline
-):
-    """根据知识梳理结果统一输出“搜索关注要素”。"""
-
-    system_prompt = f"""
-你是检索策略规划师，需要结合用户需求与已整理的知识，生成一份可供后续流程复用的“搜索关注要素”配置。
-
-## 基本信息
-- 当前日期：{now_date}
-- 背景：系统已完成基础知识梳理，必须锁定检索端的重点，避免角色随意发挥。
-
-## 任务
-1. 阅读用户需求与知识提要，提炼网络检索必须满足的条件。
-2. 针对下列维度分别给出等级（高/中/低）及简要理由：
-   - 时效性
-   - 规范性 / 专业性 / 严谨性
-   - 经验性
-   - 创新性
-   - 效率性
-3. 如需额外提醒（例如：必须引用法规、需要多地区对比、需要量化指标等），写入 extraNotes，可为空数组。
-4. 仅输出 JSON，结构示例：
-```
-{{
-  "timeliness": {{"level": "高", "reason": "说明"}},
-  "compliance": {{"level": "中", "reason": "说明"}},
-  "experience": {{"level": "低", "reason": "说明"}},
-  "innovation": {{"level": "中", "reason": "说明"}},
-  "efficiency": {{"level": "高", "reason": "说明"}},
-  "extraNotes": [["提醒1", "提醒2"]]
-}}
-```
-
-[[PROMPT-GUARD v1 START]]
-【禁止越界】
-- 禁止输出会议/活动/人物/机构的隐私信息、账号、联系方式及可复识别细节。
-- 禁止捏造实验、测试、代码执行、模型调用或未验证的结论。
-- 允许引用公开资料，但必须说明用途与适用范围，不得冒充内部结果。
-- 不得讨论与任务无关的事件。
-
-【信息不足处理】
-- 若证据不足，请明确写出“信息不足，以下为合理推测”，并说明前提。
-[[PROMPT-GUARD v1 END]]
-    """
-
-    user_prompt = f"""
-# 用户需求
-```
-{user_content}
-```
-
-# 知识提要
-```
-{knowledge_outline}
-```
-
-[[PROMPT-GUARD v1 START]]
-【禁止越界】
-- 禁止输出隐私信息或与任务无关的内容。
-- 禁止捏造来源、数据或实验。
-
-【信息不足处理】
-- 若缺乏证据，请说明信息不足并给出推测前提。
-[[PROMPT-GUARD v1 END]]
-    """
-
-    answer, reasoning, web_content_list, reference_list = qwen_model.do_call(
-        system_prompt, user_prompt, no_search=True, inner_search=False
-    )
-
     cleaned = answer.strip()
     start_index = cleaned.find("{")
     end_index = cleaned.rfind("}")
-    if start_index != -1 and end_index != -1 and end_index > start_index:
+    if start_index != -1 and end_index != -1 and end_index >= start_index:
         cleaned = cleaned[start_index:end_index + 1]
 
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        data = {"搜索关注要素": cleaned}
+    payload = json.loads(cleaned)
+    knowledge_text = payload.get("knowledgeBase", "").strip()
+    user_need_profile = payload.get("userNeedInsights", {})
+    search_focus_profile = payload.get("searchFocusProfile", {})
+    removal_hints = payload.get("removalHints", []) or []
 
-    return json.dumps(data, ensure_ascii=False, indent=2)
+    if removal_hints and knowledge_text:
+        knowledge_text = prune_knowledge_sections(knowledge_text, removal_hints)
 
+    knowledge_text = sanitize_knowledge_base(knowledge_text)
+
+    return (
+        knowledge_text,
+        json.dumps(search_focus_profile, ensure_ascii=False, indent=2),
+        json.dumps(user_need_profile, ensure_ascii=False, indent=2),
+    )
+
+def prune_knowledge_sections(knowledge_text, removal_snippets):
+    """根据提示剔除已被证伪或存疑的知识片段。"""
+
+    if not knowledge_text or not removal_snippets:
+        return knowledge_text
+
+    updated_text = knowledge_text
+    for snippet in removal_snippets:
+        fragment = (snippet or "").strip()
+        if not fragment:
+            continue
+        pattern = re.escape(fragment)
+        updated_text, _ = re.subn(pattern, "", updated_text, count=1)
+
+    return updated_text
+
+
+def sanitize_knowledge_base(knowledge_text):
+    """剔除推荐、方案类内容，仅保留理解所需信息。"""
+
+    if not knowledge_text:
+        return knowledge_text
+
+    drop_keywords = ("推荐", "建议", "方案", "行动", "路径", "推广", "部署", "购买", "投资")
+    lines = []
+    for line in knowledge_text.splitlines():
+        raw_line = line.strip()
+        if not raw_line:
+            continue
+        if any(keyword in raw_line for keyword in drop_keywords):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def extract_removal_hints_from_answer(role_answer):
+    """从研究员发言中提取需剔除的知识片段。"""
+
+    if not role_answer:
+        return []
+
+    hints = []
+    pattern = re.compile(r"\[需剔除知识](.*?)\[/需剔除知识]", re.S)
+    for block in pattern.findall(role_answer):
+        for line in block.splitlines():
+            cleaned = line.strip().lstrip("-•").strip()
+            if not cleaned:
+                continue
+            if "原文" in cleaned:
+                cleaned = cleaned.split("原文：", 1)[-1].strip()
+            if cleaned:
+                hints.append(cleaned)
+    return hints
 
 def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     """整体会议流程入口。"""
     print("\n\n用户需求:", content, "\n\n")
 
     knowledges = None
-    knowledges, refs = create_webquestion_from_user(qwen_model, content, knowledges, now_date)
+    knowledges, refs = create_webquestion_from_user(
+        qwen_model, content, knowledges, now_date
+    )
 
-    know_data, search_focus = rrange_knowledge(qwen_model, knowledges, refs, content)
+    know_data, search_focus, user_need_profile = rrange_knowledge(
+        qwen_model, knowledges, refs, content
+    )
 
     print("\n\n基础资料:\n\n", know_data)
     print("\n\n重点关注要素:\n\n", search_focus)
+    print("\n\n用户需求解读:\n\n", user_need_profile)
 
     roles = create_roles(qwen_model, content, know_data, stream=stream)
 
     epcho = 1
     his_nodes = []
+    pending_removals = []
 
     while epcho <= MAX_EPCHO:
         round_record = f"""
@@ -291,13 +321,14 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
                     f"\n\n角色：{role['role_name']}\n职业：{role['role_job']}\n性格：{role['personality']}\n\n"
                 )
 
-            new_record, new_know = role_dissucess(
+            new_record, role_answer = role_dissucess(
                 qwen_model,
                 content,
                 his_nodes,
                 round_record,
                 know_data,
                 search_focus,
+                user_need_profile,
                 now_date,
                 role,
                 epcho,
@@ -305,24 +336,28 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
                 MAX_EPCHO,
                 stream=stream,
             )
-            know_data = new_know
             round_record = new_record
+            removal_hints = extract_removal_hints_from_answer(role_answer)
+            if removal_hints:
+                pending_removals.extend(removal_hints)
 
         print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
 
         msg_content = summary_round(
-            qwen_model, content, now_date, round_record, epcho, search_focus
+            qwen_model, user_need_profile, now_date, round_record, epcho, search_focus
         )
 
-        sugg_content, can_end = summary_sugg(
+        sugg_text, can_end, sections_to_prune = summary_sugg(
             qwen_model,
             content,
             now_date,
             msg_content,
             his_nodes,
+            know_data,
             epcho,
             MAX_EPCHO,
             search_focus,
+            user_need_profile,
         )
 
         last_content = f"""
@@ -335,13 +370,35 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
 
         ## 当前讨论进度和建议
         ```
-        {sugg_content}
+        {sugg_text}
         ```
         """
 
         print("\n\n====当前讨论小结====\n", last_content)
 
         his_nodes.append(last_content)
+
+        prune_candidates = []
+        if pending_removals:
+            prune_candidates.extend(pending_removals)
+        if sections_to_prune:
+            prune_candidates.extend(sections_to_prune)
+        if prune_candidates:
+            unique_prunes = []
+            seen = set()
+            for snippet in prune_candidates:
+                cleaned = (snippet or "").strip()
+                if not cleaned or cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                unique_prunes.append(cleaned)
+            if unique_prunes:
+                know_data = prune_knowledge_sections(know_data, unique_prunes)
+                know_data = sanitize_knowledge_base(know_data)
+                print("\n====知识库修剪====\n")
+                for idx, snippet in enumerate(unique_prunes, start=1):
+                    print(f"- 移除片段{idx}: {snippet[:80]}")
+        pending_removals = []
 
         if can_end:
             print("\n====讨论中止====\n")
@@ -355,7 +412,14 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     print("\n====输出最终报告====\n")
 
     return summary(
-        qwen_model, content, now_date, his_nodes, know_data, search_focus, stream=stream
+        qwen_model,
+        content,
+        now_date,
+        his_nodes,
+        know_data,
+        search_focus,
+        user_need_profile,
+        stream=stream,
     )
 
 
@@ -365,58 +429,85 @@ def summary_sugg(
     now_date,
     round_record_message,
     his_nodes,
+    knowledge_snapshot,
     epcho,
     max_epcho,
     search_focus,
+    user_need_profile,
     stream: AIStream = None,
 ):
-    """生成当前讨论进度与后续建议。"""
+    """生成当前讨论进度、核验结果及下一步建议。"""
+
+    verification_schema = """```
+{
+  "approvedContent": "有序列表 Markdown",
+  "pendingContent": "有序列表 Markdown",
+  "nextStepsContent": "如需继续讨论时的建议",
+  "canEndMeeting": false,
+  "verificationChecklist": [
+    {
+      "topicGroup": "approved|pending",
+      "topicTitle": "议题标题",
+      "question": "具体检索问题",
+      "time": "week|month|semiyear|year|none",
+      "status": "verified|disputed|pending",
+      "evidenceSummary": "依据摘要，说明结论是否成立",
+      "sourceCitations": [
+        {
+          "title": "文章或网页标题",
+          "author": "作者或机构",
+          "publishedAt": "时间",
+          "url": "链接"
+        }
+      ],
+      "pruneSnippet": "若需从知识库移除的原文句子，没有则留空"
+    }
+  ],
+  "sectionsToPrune": ["知识库中需删除的片段，可为空"]
+}
+```"""
 
     system_prompt = f"""
-你正在跟踪一次多轮研究讨论，需基于输入信息给出进展评估。
+你正在跟踪一次多轮研究讨论，需要基于输入信息给出进展评估并完成证据核验。
 
 ## 基本信息
 - 当前日期：{now_date}
 - 当前轮次：第{epcho}轮 / 共 {max_epcho} 轮
 - 模式：理论研究，禁止实验、测试、代码执行。
-- 检索关注要素：所有决策需符合下方配置，必要时提醒研究员遵守对应的时效性/规范性/经验性/创新性/效率性等级。
+- 检索关注要素：所有判断需符合下方配置，必要时提醒研究员遵守对应的时效性、规范性、经验性、创新性、效率性等级。
 
 ```
 {search_focus}
 ```
 
-## 任务
-1. 将本轮讨论与历史总结进行综合比对，明确：
-   - 已达成一致的结论（按重要性列出，使用有序列表）。
-   - 仍存在分歧或待补充的议题（同样使用有序列表说明原因）。
-2. 评估讨论是否可结束：
-   - 若可结束，给出理由并设置 canEndMeeting = true。
-   - 若仍需继续，提供新增且更深入的讨论建议，避免复述历史内容。
-3. 输出 JSON，对象包含：
-   - approvedContent（字符串，内含有序列表 Markdown）。
-   - pendingContent（字符串，内含有序列表 Markdown）。
-   - nextStepsContent（字符串，如需继续讨论时提供）。
-   - canEndMeeting（布尔值）。
+## 核验与搜索要求
+1. 先根据讨论内容判定“已通过结论”与“仍待结论”的议题。
+2. 针对两类议题分别生成 1~4 条高质量检索问题（question_list），合并为一次 `web_search` 调用；禁止重复或含糊问题。
+3. 核验结果需说明：
+   - 检索问题
+   - 证据结论（通过 / 存疑 / 待定）
+   - 主要来源（标题、作者或机构、时间、链接）
+   - 是否需要从知识库剔除对应片段
+4. 若无法获取有效结果，需在 checklist 中写明“来源不足”和下一步计划。
 
-    ## 结束条件
-    - 达到最大轮次视为必须收尾。
-    - 仅当所有关键问题已有清晰结论且无重大分歧时才能结束。
+## 输出 JSON 结构（仅输出 JSON）：
+{verification_schema}
 
 [[PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
+- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
+- 若证据不足，必须写明“信息不足，以下为合理推测”并阐明前提。
+- 检索与引用内容均需可追溯，禁止使用“搜索结果/引用2/来源A”等占位符。
 [[PROMPT-GUARD v1 END]]
-总结不得引入会话与已检索结果之外的新论文/新工业案例/新实验数据；仅可归纳已有讨论与通用概念。
+总结不得引入会话与已检索结果之外的新结论，仅可提出需要补充的核验动作。
     """
 
     user_prompt = f"""
+# 用户需求解读
+```
+{user_need_profile}
+```
+
 # 本轮讨论概要
 ```
 {round_record_message}
@@ -427,57 +518,70 @@ def summary_sugg(
 {json.dumps(his_nodes, ensure_ascii=False, indent=2)}
 ```
 
+# 当前知识库摘要
+```
+{knowledge_snapshot}
+```
+
 [[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
+【严禁虚构与跑题（硬性约束）】与上方一致。
+【信息不足时的处理】与上方一致。
 [[PROMPT-GUARD v1 END]]
-"""
+    """
 
     answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt, user_prompt, stream=stream, no_search=True
+        system_prompt, user_prompt, stream=stream, no_search=False
     )
 
-    answer = re.sub(r"}\s*，\s*{", "},{", answer)
+    normalized = re.sub(r"}\s*，\s*{", "},{", answer)
+    start_index = normalized.find("{")
+    end_index = normalized.rfind("}")
+    if start_index != -1 and end_index != -1 and end_index >= start_index:
+        normalized = normalized[start_index:end_index + 1]
 
-    start_index = answer.find("{")
-    end_index = answer.rfind("}")
+    try:
+        json_data = json.loads(normalized)
+    except json.JSONDecodeError:
+        return answer.strip(), False, []
 
-    if start_index != -1 and end_index != -1:
-        answer = answer[start_index:end_index + 1]
+    verification_checklist = json_data.get("verificationChecklist", []) or []
+    sections_to_prune = json_data.get("sectionsToPrune", []) or []
 
-    json_data = json.loads(answer)
+    approved_section = json_data.get("approvedContent", "- （无）")
+    pending_section = json_data.get("pendingContent", "- （无）")
+    next_steps = json_data.get("nextStepsContent", "- （未提供）")
+
+    verified_report = format_verification_section(verification_checklist, "approved")
+    pending_report = format_verification_section(verification_checklist, "pending")
 
     long_content = f"""
     ## 讨论已明确通过的结论
 
-    {json_data['approvedContent']}
+    {approved_section}
+
+    ### 证据核验（已通过议题）
+    {verified_report}
 
     ## 仍未形成结论的议题
 
-    {json_data['pendingContent']}
+    {pending_section}
+
+    ### 证据核验（待定议题）
+    {pending_report}
+    """.strip()
+
+    if not json_data.get("canEndMeeting", False):
+        long_content += f"""
+
+    ## 下一步讨论建议
+    {next_steps}
     """
 
-    cem = json_data.get("canEndMeeting", False)
-    if not cem:
-        long_content += f"""
-        ## 下一步讨论建议
-
-        {json_data['nextStepsContent']}
-        """
-
-    return long_content, cem
-
+    return long_content, json_data.get("canEndMeeting", False), sections_to_prune
 
 def summary_round(
     qwen_model: QwenModel,
-    content,
+    user_need_profile,
     now_date,
     round_record,
     epcho,
@@ -499,7 +603,7 @@ def summary_round(
 ```
 
 ## 输入
-- 用户需求：{content}
+- 用户需求解读：{user_need_profile}
 - 本轮所有研究员的完整发言记录。
 
     ## 输出要求
@@ -554,6 +658,7 @@ def summary(
     his_nodes,
     knowledge,
     search_focus,
+    user_need_profile,
     stream: AIStream = None,
 ):
     """会议最终总结。"""
@@ -570,6 +675,10 @@ def summary(
 - 检索关注要素：所有最终结论都要说明如何满足下方约束，必要时提示残留风险。
 ```
 {search_focus}
+```
+ - 用户需求解读：请确保交付形式、目标、细节关注点与下方解析保持一致。
+```
+{user_need_profile}
 ```
 
     ## 任务
@@ -593,6 +702,7 @@ def summary(
     ## 输出格式
 - 使用 Markdown，结构清晰。
 - 必须包含：
+  - 用户需求解读
   - 会议总体结论
   - 关键依据（可分条列出）
   - 创新概念与定义（若有）
@@ -609,6 +719,11 @@ def summary(
 # 已整理知识库
 ```
 {knowledge}
+```
+ 
+# 用户需求解读
+```
+{user_need_profile}
 ```
 
 [[PROMPT-GUARD v1 START]]
