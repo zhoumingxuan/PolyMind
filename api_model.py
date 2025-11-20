@@ -163,13 +163,13 @@ class QwenModel:
                         thinking_budget=1024 * 32,
                         enable_thinking=True,
                         tools=tools_data,
-                        enable_search=True if inner_search else False,  # 开启联网搜索的参数
-                        search_options={
-                            "forced_search": True,  # 强制开启联网搜索
-                            "enable_source": False,  # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
-                            "enable_citation": False,  # 开启角标标注功能
-                            "search_strategy": "pro"  # 模型将搜索10条互联网信息
-                        } if inner_search else None,
+                        # enable_search=True if inner_search else False,  # 开启联网搜索的参数
+                        # search_options={
+                        #     "forced_search": True,  # 强制开启联网搜索
+                        #     "enable_source": True,  # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
+                        #     "enable_citation": False,  # 开启角标标注功能
+                        #     "search_strategy": "pro"  # 模型将搜索10条互联网信息
+                        # } if inner_search else None,
                         stream=True,
                         include_usage=True,
                         incremental_output=True,

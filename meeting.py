@@ -113,14 +113,14 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
 
     structure_example = """```
 {
-  "knowledgeBase": "Markdown 结构化内容，突出概念、定义、法规、现状数据与案例",
+  "知识整理": "Markdown 结构化内容，突出概念、定义、法规、现状数据与案例",
   "userNeedInsights": {
-    "targetDeliverable": "用户期望的交付形态，例如《xx对比报告》",
-    "coreObjectives": ["目标1", "目标2"],
-    "detailConstraints": ["必须回答的细节、指标口径、量化要求"],
-    "givenEvidence": ["用户提供的既有知识或数据来源（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
-    "researchAngles": ["用户指定的参考方向/方法/范围/比较维度（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
-    "riskAlerts": ["潜在争议或限制"]
+    "期望交付形态": "用户期望的交付形态，例如《xx对比报告》",
+    "研究核心目标": ["目标1", "目标2"],
+    "必须回答的细节": ["必须回答的细节、指标口径、量化要求"],
+    "用户提供的既有知识或数据来源": ["用户提供的既有知识或数据来源（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
+    "用户提供的参考": ["用户指定的参考方向/方法/范围/比较维度（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
+    "风险提示": ["潜在争议或限制"]
   },
   "searchFocusProfile": {
     "timeliness": {"level": "高", "reason": "说明原因"},
@@ -216,7 +216,7 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content
         cleaned = cleaned[start_index:end_index + 1]
 
     payload = json.loads(cleaned)
-    knowledge_text = payload.get("knowledgeBase", "").strip()
+    knowledge_text = payload.get("知识整理", "").strip()
     user_need_profile = payload.get("userNeedInsights", {})
     search_focus_profile = payload.get("searchFocusProfile", {})
     removal_hints = payload.get("removalHints", []) or []
@@ -266,25 +266,6 @@ def sanitize_knowledge_base(knowledge_text):
         lines.append(line)
     return "\n".join(lines).strip()
 
-
-def extract_removal_hints_from_answer(role_answer):
-    """从研究员发言中提取需剔除的知识片段。"""
-
-    if not role_answer:
-        return []
-
-    hints = []
-    pattern = re.compile(r"\[需剔除知识](.*?)\[/需剔除知识]", re.S)
-    for block in pattern.findall(role_answer):
-        for line in block.splitlines():
-            cleaned = line.strip().lstrip("-•").strip()
-            if not cleaned:
-                continue
-            if "原文" in cleaned:
-                cleaned = cleaned.split("原文：", 1)[-1].strip()
-            if cleaned:
-                hints.append(cleaned)
-    return hints
 
 def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     """整体会议流程入口。"""
@@ -337,9 +318,6 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
                 stream=stream,
             )
             round_record = new_record
-            removal_hints = extract_removal_hints_from_answer(role_answer)
-            if removal_hints:
-                pending_removals.extend(removal_hints)
 
         print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
 
@@ -464,10 +442,10 @@ def summary_sugg(
 ## 任务
 1. 解析“本轮讨论概要”中的数据引用、观点来源或争议点，并转换为 question_list 交由 `web_search` 核验。
 2. 检索完成后，对议题进行如下分类：
-   a. 讨论已达成一致的信息，且检索确认可追溯来源（或属行业通用共识）→ “已核验的依据”。
-   b. 讨论已达成一致的信息，但无法确认可靠来源，也不属约定俗成 → “被否决的依据”。
-   c. 讨论存在争议的信息，但检索提供了可信证据，可据此统一口径 → “已核验的依据”。
-   d. 讨论存在争议的信息，且不满足以上**(a,b,c点)**，则统一视作“被否决的依据”。
+   a. 讨论数据引用，有明确的来源标注(需确认具体来源），或者属于约定俗成 → “已核验的依据”。
+   b. 讨论数据引用，无法确认可靠来源，也不属约定俗成 → “被否决的依据”。
+   c. 讨论存在争议的数据引用，但检索提供了可信证据，可据此统一口径 → “已核验的依据”。
+   d. 讨论存在争议的数据引用，且不满足以上**(a,b,c点)**，则统一视作“被否决的依据”。
    e. 讨论中，若研究员存在讨论偏离用户需求，必须明确指出（具体到哪位研究员，哪部分的表述），无论任何场景下，直接视作“被否决的结论”。
    f. 讨论中，基于“已核验的依据”且绝对不包含“被否决的依据”推演所得的观点，研究员达成共识并且逻辑合理，校验通过，则视作“已通过结论”。
    g. 讨论中，基于“已核验的依据”且绝对不包含“被否决的依据”推演所得的观点，逻辑合理且校验通过，但研究员并未达成共识，则视作“仍待讨论的议题”，并明确说明论据已核验。
@@ -479,6 +457,7 @@ def summary_sugg(
    1.知识库仅用于需要剔除哪些知识点的比对，绝对禁止用于上述任务的核验，无论任何场景都绝对禁止；但仅限于该处核验的情况，故此不必在描述中声明这个要求。
    2.核验时必须调用`web_search`,绝对禁止自我欺骗式认为调用过。
    3.已有知识库并不能覆盖所有知识，仅能作为帮助理解课题的知识库存在，故此必须调用网络搜索工具进行查找。
+   4."历史讨论概要"绝对禁止参与核验，仅用于在给出下一阶段的讨论规划时作为参考信息使用。
 
 ## 输出要求
    1.输出包含六部分内容：
