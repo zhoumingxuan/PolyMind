@@ -109,7 +109,7 @@ class QwenModel:
     def _safe_msg_attr(msg, attr, default=None):
         try:
             return getattr(msg, attr)
-        except (AttributeError, KeyError):
+        except Exception:
             return default
 
     def do_tool_calls(self, tool_calls, messages):
@@ -227,11 +227,11 @@ class QwenModel:
                         if stream:
                             stream.process_chunk(chunk_content)
                         answer_content.append(chunk_content)
-            except (requests.exceptions.ChunkedEncodingError, ProtocolError):
+            except Exception:
                 attempt += 1
                 if attempt >= max_stream_retries:
                     raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。")
-                time.sleep(2)
+                time.sleep(60)
                 continue
 
             self.total_tokens_count += total_tokens

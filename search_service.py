@@ -28,7 +28,7 @@ class SearchProviderBase:
         self.cfg = cfg
         self._cache: Dict[str, Tuple[str, List[Dict]]] = {}
         self.cooldown = float(cfg.get("search_cooldown", 1.0) or 1.0)
-        self.retry_delay = int(cfg.get("search_retry_delay", 30) or 30)
+        self.retry_delay = int(cfg.get("search_retry_delay", 60) or 60)
 
     def _cache_key(self, question: str, time_filter: str) -> str:
         return f"{question.strip()}|||{time_filter or 'none'}"
@@ -49,8 +49,6 @@ class SearchProviderBase:
 
         try:
             result = self._search(question, time_filter)
-        except SearchProviderError:
-            raise
         except Exception:  # pylint: disable=broad-except
             time.sleep(self.retry_delay)
             result = self._search(question, time_filter)
