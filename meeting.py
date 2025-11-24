@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import time
 import uuid
 import re
 
@@ -282,10 +283,18 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     knowledges, refs = create_webquestion_from_user(
         qwen_model, content, knowledges, now_date
     )
-
-    know_data, search_focus, user_need_profile = rrange_knowledge(
+    
+    while True:
+     try:
+      know_data, search_focus, user_need_profile = rrange_knowledge(
         qwen_model, knowledges, refs, content
-    )
+      )
+      break
+     except Exception:
+      print("\n出现返回错误，资料重新整理\n")
+      time.sleep(60)
+      continue
+      
 
     print("\n\n基础资料:\n\n", know_data)
     print("\n\n重点关注要素:\n\n", search_focus)
@@ -332,7 +341,7 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
             qwen_model, user_need_profile, now_date, round_record, epcho, search_focus
         )
 
-        sugg_text, can_end, sections_to_prune = summary_sugg(
+        sugg_text, can_end = summary_sugg(
             qwen_model,
             user_need_profile,
             now_date,
@@ -361,28 +370,6 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
         print("\n\n====当前讨论小结====\n", last_content)
 
         his_nodes.append(last_content)
-
-        prune_candidates = []
-        if pending_removals:
-            prune_candidates.extend(pending_removals)
-        if sections_to_prune:
-            prune_candidates.extend(sections_to_prune)
-        if prune_candidates:
-            unique_prunes = []
-            seen = set()
-            for snippet in prune_candidates:
-                cleaned = (snippet or "").strip()
-                if not cleaned or cleaned in seen:
-                    continue
-                seen.add(cleaned)
-                unique_prunes.append(cleaned)
-            if unique_prunes:
-                know_data = prune_knowledge_sections(know_data, unique_prunes)
-                know_data = sanitize_knowledge_base(know_data)
-                print("\n====知识库修剪====\n")
-                for idx, snippet in enumerate(unique_prunes, start=1):
-                    print(f"- 移除片段{idx}: {snippet[:80]}")
-        pending_removals = []
 
         if can_end:
             print("\n====讨论中止====\n")
@@ -489,14 +476,11 @@ def summary_sugg(
      "rejectContent": "",
      "pendingContent": "",
      "canEndMeeting": False,
-     "nextStepsContent": "",
-     "sectionsToPrune": []
+     "nextStepsContent": ""
    }}
    ```
 
  2.各字符串字段若无内容，可填入类似“无明显新增内容”之类的中文说明，避免留空。
-
- 3.sectionsToPrune 必须是字符串数组（可以为空数组），数组元素为待删除片段的文本。
 
 [PROMPT-GUARD v1 START]]
 【严禁虚构与跑题（硬性约束）】
@@ -554,7 +538,6 @@ def summary_sugg(
     reject_section = json_data.get("rejectContent", "- （无）")
     pending_section = json_data.get("pendingContent", "- （无）")
     next_steps = json_data.get("nextStepsContent", "- （未提供）")
-    sections_to_prune = json_data.get("sectionsToPrune", []) or []
     canEndMeeting = bool(json_data.get("canEndMeeting", False))
 
     long_content = f"""
@@ -587,7 +570,7 @@ def summary_sugg(
     {next_steps}
     """
 
-    return long_content, canEndMeeting, sections_to_prune
+    return long_content, canEndMeeting
 
 
 def summary_round(
