@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import re
 import time
@@ -5,6 +6,7 @@ from datetime import datetime
 
 import dashscope
 import requests
+from requests.exceptions import ChunkedEncodingError, ConnectionError as RequestsConnectionError
 from urllib3.exceptions import ProtocolError
 
 from config import ConfigHelper
@@ -112,6 +114,11 @@ class QwenModel:
         except Exception:
             return default
 
+    @staticmethod
+    def _sleep_with_backoff(attempt: int, base_delay: int = 8, max_delay: int = 120):
+        delay = min(max_delay, base_delay * (attempt + 1))
+        time.sleep(delay)
+
     def do_tool_calls(self, tool_calls, messages):
         for tool_call in tool_calls:
             func_name = tool_call["function"]["name"]
@@ -143,12 +150,13 @@ class QwenModel:
         no_search: bool = False,
         inner_search: bool = False,
     ):
-        max_stream_retries = 3
-        attempt = 0
+        max_stream_retries = 10
+        stream_attempt = 0
+        request_attempt = 0
 
-        time.sleep(5)
+        time.sleep(10)
 
-        tools_data=None if no_search else self.tools
+        tools_data = None if no_search else self.tools
 
         while True:
             response = None
@@ -175,9 +183,11 @@ class QwenModel:
                         incremental_output=True,
                         result_format=result_format,
                     )
+                    request_attempt = 0
                 except Exception:
+                    request_attempt += 1
                     response = None
-                    time.sleep(60)
+                    self._sleep_with_backoff(request_attempt)
                     continue
 
             reasoning_content = []
@@ -227,14 +237,16 @@ class QwenModel:
                         if stream:
                             stream.process_chunk(chunk_content)
                         answer_content.append(chunk_content)
-            except Exception:
-                attempt += 1
-                if attempt >= max_stream_retries:
-                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。")
-                time.sleep(60)
+            except (ProtocolError, ChunkedEncodingError, RequestsConnectionError, Exception) as exc:
+                stream_attempt += 1
+                if stream_attempt >= max_stream_retries:
+                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。") from exc
+                self._sleep_with_backoff(stream_attempt)
                 continue
 
             self.total_tokens_count += total_tokens
+
+            print("Tokens:",total_tokens,"   ",self.total_tokens_count)
             if self.total_tokens_count > 50000:
                 time.sleep(60)
                 self.total_tokens_count = 0
