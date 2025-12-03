@@ -109,17 +109,30 @@ class QwenModel:
 
     @staticmethod
     def _safe_msg_attr(msg, attr, default=None):
+        """
+        安全读取 message 上的属性，兼容对象形式和 dict 形式。
+        """
+        if msg is None:
+            return default
+
+        # dict 形式：优先用 get
+        if isinstance(msg, dict):
+            return msg.get(attr, default)
+
+        # 对象形式：用 getattr
         try:
             return getattr(msg, attr)
         except Exception:
             return default
 
-    @staticmethod
-    def _sleep_with_backoff(attempt: int, base_delay: int = 8, max_delay: int = 120):
-        delay = min(max_delay, base_delay * (attempt + 1))
-        time.sleep(delay)
-
     def do_tool_calls(self, tool_calls, messages):
+        """
+        处理所有 tool_calls：逐一执行并补回 tool 消息。
+        注意：tool 消息的 content 必须是字符串，这里统一 json.dumps。
+        """
+        all_data = []
+        all_refs = []
+
         for tool_call in tool_calls:
             func_name = tool_call["function"]["name"]
             args_data = tool_call["function"].get("arguments", "[]")
@@ -135,11 +148,17 @@ class QwenModel:
                 data_content, ref_data = search_list(**args)
                 refs.extend(ref_data)
 
-            messages.append(
-                {"role": "tool", "tool_call_id": tool_id, "content": data_content}
-            )
+            # content 必须为字符串
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": json.dumps(data_content or [], ensure_ascii=False)
+            })
 
-            return data_content, refs
+            all_data.extend(data_content or [])
+            all_refs.extend(refs or [])
+
+        return all_data, all_refs
 
     def send_messages(
         self,
@@ -150,63 +169,89 @@ class QwenModel:
         no_search: bool = False,
         inner_search: bool = False,
     ):
-        max_stream_retries = 10
-        stream_attempt = 0
-        request_attempt = 0
+        """
+        发送消息到 DashScope 并以流式方式解析返回结果。
 
-        time.sleep(10)
+        关键点：
+        - 支持思考模型(enable_thinking=True, incremental_output=True)。
+        - 兼容“部分 chunk 只有 usage、没有 choices”的情况。
+        - 对网络中断、限流等异常做整体重试（指数回退）。
+        - 对 400/InvalidParameter（如 content 缺失）不做无意义重试，直接抛出。
+        """
+
+        max_retries = 6
+        base_backoff = 5
+
+        # 简单的节流（防止瞬时 QPS 过高）
+        time.sleep(3)
 
         tools_data = None if no_search else self.tools
 
-        while True:
-            response = None
-            while response is None:
-                try:
-                    response = dashscope.Generation.call(
-                        api_key=self.api_key,
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=1024 * 16,
-                        thinking_budget=1024 * 32,
-                        enable_thinking=True,
-                        tools=tools_data,
-                        # enable_search=True if inner_search else False,  # 开启联网搜索的参数
-                        # search_options={
-                        #     "forced_search": True,  # 强制开启联网搜索
-                        #     "enable_source": True,  # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
-                        #     "enable_citation": False,  # 开启角标标注功能
-                        #     "search_strategy": "pro"  # 模型将搜索10条互联网信息
-                        # } if inner_search else None,
-                        stream=True,
-                        include_usage=True,
-                        incremental_output=True,
-                        result_format=result_format,
-                    )
-                    request_attempt = 0
-                except Exception:
-                    request_attempt += 1
-                    response = None
-                    self._sleep_with_backoff(request_attempt)
-                    continue
+        attempt = 0
+        last_exception = None
 
-            reasoning_content = []
-            answer_content = []
-            total_tokens = 0
-            tool_response = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": []
-            }
-
-            toolcall_infos = []
-
+        while attempt < max_retries:
             try:
-                for chunk in response:
-                    msg = chunk.output.choices[0].message
+                response = dashscope.Generation.call(
+                    api_key=self.api_key,
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=1024 * 16,
+                    thinking_budget=1024 * 32,
+                    enable_thinking=True,
+                    tools=tools_data,
+                    # enable_search=True if inner_search else False,
+                    stream=True,
+                    include_usage=True,
+                    incremental_output=True,
+                    result_format=result_format,
+                )
 
-                    if chunk.get("usage"):
-                        total_tokens = chunk.usage.total_tokens
+                reasoning_content = []
+                answer_content = []
+                total_tokens = 0
+                tool_response = {
+                    "role": "assistant",
+                    "content": " ",
+                    "tool_calls": []
+                }
+                toolcall_infos = []
+
+                for chunk in response:
+                    status_code = getattr(chunk, "status_code", None)
+                    if status_code and status_code != 200:
+                        err_code = getattr(chunk, "code", None)
+                        err_msg = getattr(chunk, "message", None)
+                        raise RuntimeError(
+                            f"DashScope 流式块错误: status_code={status_code}, code={err_code}, message={err_msg}"
+                        )
+
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        if isinstance(usage, dict):
+                            total_tokens = usage.get("total_tokens", total_tokens)
+                        else:
+                            total_tokens = getattr(usage, "total_tokens", total_tokens)
+
+                    output = getattr(chunk, "output", None)
+                    if output is None:
+                        continue
+
+                    if isinstance(output, dict):
+                        choices = output.get("choices")
+                    else:
+                        choices = getattr(output, "choices", None)
+
+                    if not choices:
+                        continue
+
+                    choice0 = choices[0]
+                    msg = None
+                    if isinstance(choice0, dict):
+                        msg = choice0.get("message") or choice0.get("delta") or {}
+                    else:
+                        msg = getattr(choice0, "message", None) or getattr(choice0, "delta", None) or {}
 
                     msg_reasoning = self._safe_msg_attr(msg, "reasoning_content", "")
                     msg_content = self._safe_msg_attr(msg, "content", "")
@@ -217,60 +262,81 @@ class QwenModel:
 
                     if msg_tool_calls:
                         for tool_call in msg_tool_calls:
-                            index = tool_call["index"]
-
+                            index = tool_call.get("index", 0)
                             while len(toolcall_infos) <= index:
                                 toolcall_infos.append({"id": "", "name": "", "arguments": ""})
 
                             if "id" in tool_call:
                                 toolcall_infos[index]["id"] += tool_call.get("id", "")
 
-                            if "function" in tool_call:
-                                func = tool_call["function"]
-                                if "name" in func:
-                                    toolcall_infos[index]["name"] += func.get("name", "")
-                                if "arguments" in func:
-                                    toolcall_infos[index]["arguments"] += func.get("arguments", "")
+                            func = tool_call.get("function") or {}
+                            if "name" in func:
+                                toolcall_infos[index]["name"] += func.get("name", "")
+                            if "arguments" in func:
+                                toolcall_infos[index]["arguments"] += func.get("arguments", "")
 
                     if msg_content:
-                        chunk_content = msg_content
                         if stream:
-                            stream.process_chunk(chunk_content)
-                        answer_content.append(chunk_content)
-            except (ProtocolError, ChunkedEncodingError, RequestsConnectionError, Exception) as exc:
-                stream_attempt += 1
-                if stream_attempt >= max_stream_retries:
-                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。") from exc
-                self._sleep_with_backoff(stream_attempt)
+                            stream.process_chunk(msg_content)
+                        answer_content.append(msg_content)
+
+                self.total_tokens_count = total_tokens
+                if self.total_tokens_count > 50000:
+                    print("\n累计 tokens 已超过 50000，休眠 120s 再继续使用 DashScope")
+                    time.sleep(120)
+                    self.total_tokens_count = 0
+
+                if toolcall_infos:
+                    for t_index, tool_call in enumerate(toolcall_infos):
+                        item = {
+                            "function": {
+                                "name": tool_call["name"],
+                                "arguments": tool_call["arguments"],
+                            },
+                            "id": tool_call["id"],
+                            "index": t_index,
+                            "type": "function",
+                        }
+                        tool_response["tool_calls"].append(item)
+
+                answer_text = "".join(answer_content)
+                reasoning_text = "".join(reasoning_content)
+
+                # 关键：当存在 tool_calls 且答案文为空时，给一个最小非空占位，避免 400
+                if tool_response["tool_calls"] and not answer_text.strip():
+                    answer_text = " "  # 单空格即可满足“非空字符串”要求
+
+                tool_response["content"] = answer_text
+                tool_response["reasoning_content"] = reasoning_text
+                tool_response["usage"] = {"total_tokens": total_tokens}
+
+                return answer_text, reasoning_text, tool_response
+
+            except (ProtocolError, ChunkedEncodingError, RequestsConnectionError) as exc:
+                attempt += 1
+                last_exception = exc
+                backoff = min(120, base_backoff * (2 ** (attempt - 1)))
+                print(
+                    f"DashScope streaming 响应异常终止（{exc}），将在 {backoff}s 后进行第 {attempt}/{max_retries} 次重试"
+                )
+                time.sleep(backoff)
+                continue
+            except Exception as exc:
+                # 对明显的 400/InvalidParameter（content 缺失/为空）不做重试
+                msg = str(exc)
+                if ("status_code=400" in msg) or ("InvalidParameter" in msg) or ("content field is a required field" in msg):
+                    raise
+
+                attempt += 1
+                last_exception = exc
+                backoff = min(120, base_backoff * (2 ** (attempt - 1)))
+                print(
+                    f"DashScope 调用/解析异常（{exc}），将在 {backoff}s 后进行第 {attempt}/{max_retries} 次重试"
+                )
+                time.sleep(backoff)
                 continue
 
-            self.total_tokens_count += total_tokens
-
-            print("Tokens:",total_tokens,"   ",self.total_tokens_count)
-            if self.total_tokens_count > 50000:
-                time.sleep(60)
-                self.total_tokens_count = 0
-
-            if toolcall_infos:
-                for t_index, tool_call in enumerate(toolcall_infos):
-                    item = {
-                        "function": {
-                            "name": tool_call["name"],
-                            "arguments": tool_call["arguments"],
-                        },
-                        "id": tool_call["id"],
-                        "index": t_index,
-                        "type": "function",
-                    }
-                    tool_response["tool_calls"].append(item)
-
-            answer_text = "".join(answer_content)
-            reasoning_text = "".join(reasoning_content)
-            tool_response["content"] = answer_text
-            tool_response["reasoning_content"] = reasoning_text
-            tool_response["usage"] = {"total_tokens": total_tokens}
-
-            return answer_text, reasoning_text, tool_response
+        raise RuntimeError(f"DashScope 多次重试后仍然失败: {last_exception}")
 
     def do_call(
         self,
@@ -297,15 +363,17 @@ class QwenModel:
             result_format=result_format,
         )
 
-
         references = []
         while tool_response["tool_calls"]:
+            # 直接把 tool_response 作为消息加入（沿用你早期写法的习惯）
             messages.append(tool_response)
+
             web_search_list, web_references = self.do_tool_calls(
                 tool_response["tool_calls"], messages
             )
             web_content_list.extend(web_search_list or [])
             references.extend(web_references or [])
+
             answer, reasoning, tool_response = self.send_messages(
                 messages,
                 stream,
@@ -398,7 +466,7 @@ def create_webquestion_from_user(
         question = item["question"]
         time_range = item["time"]
 
-        print("需要搜索的问题:", question, "\n\n")
+        print("\n需要搜索的问题:", question,"\n")
         web_content, ref_items = web_search(question, time_range)
 
         refs.extend(ref_items)
@@ -436,7 +504,7 @@ def search_list(question_list):
             continue
         time_range = item.get("time", "none")
 
-        print("需要搜索的问题:", question, "\n\n")
+        print("需要搜索的问题:", question, "\n")
         web_content, refs_items = web_search(question, time_range)
 
         results.append({
@@ -446,5 +514,3 @@ def search_list(question_list):
         refs.extend(refs_items)
 
     return results, refs
-
-
