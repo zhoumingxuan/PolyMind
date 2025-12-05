@@ -3,8 +3,8 @@ import json
 import time
 import uuid
 import re
-
-from api_model import QwenModel, AIStream, create_webquestion_from_user
+from knowledge import create_webquestion_from_user,rrange_knowledge
+from api_model import QwenModel, AIStream
 from role import role_dissucess
 from config import ConfigHelper
 
@@ -15,257 +15,215 @@ now_date = datetime.today().strftime("%Y年%m月%d日")
 MAX_EPCHO = config.get("max_epcho", 5)
 ROLE_COUNT = config.get("role_count", 5)
 
-def create_plan(qwen_model: QwenModel, content, user_need_profile, knowledges, roles, stream=None):
-    """根据需求制定多轮讨论大纲"""
+
+def create_initial_solution(qwen_model: QwenModel, content, knowledge):
+    """
+    根据用户需求与基础知识库，生成一个“能够解决用户需求”的初步方案框架，
+    供后续研究员在多轮讨论中进一步完善与讨论。
+    返回值：纯文本（Markdown 风格），只描述方案本身。
+    """
 
     system_prompt = f"""
-你正在作为研究主持人，为一次多智能体“理论研究讨论”制定完整的讨论大纲。
+# 任务
+  1. 你需要基于用户需求构建一个解决该需求的初步方案框架。
+  2. 该方案仅作为后续研究和完善的起点，不是最终结论。
 
-【基本信息】
-- 当前日期：{now_date}
-- 最大讨论轮数：{MAX_EPCHO}
-- 讨论模式：仅限理论研究与分析推理。
-  严禁在任何描述中假定开展或参与以下行为：
-  - 实验、测试、运行或修改代码
-  - 操作或调用任何外部系统
-  - 部署服务、执行交易或其他现实业务操作
+# 禁止约束
+  1. 绝对严格禁止产生任何“下一步计划”“后续建议”“实施步骤”等具有行动导向含义的内容。
+  2. 绝对严格禁止提及实验、测试、验证、上线、部署、运行或修改代码、调用外部系统等实际操作行为。
+  3. 绝对严格禁止出现与用户需求无关的内容或扩展话题。
+  4. 绝对严格禁止给出确定性的最终结论，例如“已经证明……”“可以确定……”“结论是……等表述。
+  5. 避免使用带有强烈指令或要求色彩的语气（如“必须”“务必”“一定要”“需要先……”等），
+     更适合使用中性描述，比如“可以被设计为……”“可以被划分为……”。
+  6. 绝对严格禁止与初步方案无关的任何多余表述。
 
-【大纲制定原则】
-1. 所有讨论目标必须严格围绕用户需求展开。
-   - “用户需求解读”仅用于帮助你结构化理解需求，不得据此随意扩展、改变或替换用户的原始目标。
-2. 必须为每一轮（从第 1 轮到第 {MAX_EPCHO} 轮）中每一个角色给出讨论计划，避免出现“某轮无人推进关键问题”的情况。
-3. 每一轮、每个角色的计划只需给出本轮的**阶段性研究目标或探索方向**，而不是详细操作步骤或预设结论。
-4. 计划要服务于“逐步收敛”的过程：
-   - 前几轮聚焦于澄清问题、拆解结构、枚举可能的解释或路径；
-   - 中间轮聚焦于比较、筛选和修正这些候选路径；
-   - 最后几轮聚焦于收敛：形成理论框架、结论边界和后续待研究清单，而不是在计划中直接写出具体结论内容。
+# 网络搜索工具说明
+  1. 基础知识只能用于理解用户需求，鼓励在构建初步方案时调用网络搜索工具补充信息。
+  2. 如需检索，尽量将检索问题成组设计，一次性或少量批量调用，避免频繁零散调用。
+  3. 每个检索问题应尽量明确时间范围、地域/主体和关键限制条件，避免语义重叠或含义重复。
+  4. 严禁提出含义相同或高度等价的问题进行重复搜索。
+  5. 如引用网络数据，在信息本身包含明确来源时，可简要标注来源名称和时间；严禁虚构来源或捏造具体数字。
+     对缺乏可靠来源支撑的细节，可以保持模糊或不写，禁止强行补全。
 
-【粒度与不确定性要求】
-1. 这份计划是“研究导航图”，而不是“详细操作说明书”：
-   - 不要提前写出具体结论；
-   - 不要在目标中堆砌大量技术细节（例如具体算法名称、参数取值、文件格式细节、设备型号等）。
+# 基本信息
+  1. 当前日期：{now_date}
+  2. 工作模式：仅限理论研究与分析推理。
+  3. 在所有表述中，都视为尚未开展任何实际业务或技术活动，你只描述一个可供讨论的方案结构。
 
-2. 每个角色在每一轮的 "讨论目标"：
-   - 数量为 1～2 条，禁止超过 2 条；
-   - 每条目标控制在一句相对简短的中文句子内，聚焦一个核心方向，例如：
-     “澄清关键概念及其相互关系”、“提出并整理若干候选假设”、“初步搭建用于后续论证的理论分析框架”等。
 
-3. 每一轮必须给出一个 "本轮讨论目标"：
-   - 数量为至少 5 条，禁止超过 10 条；
-   - 这是这一轮在整体研究上希望达到的阶段性目标；
-   - 用一个中文句子描述，粒度高于单个角色的目标；
-   - 只描述“本轮要把问题推进到什么状态”，不直接写出具体结论。
+# 方案生成目标
+  1. 方案需要紧贴用户需求，以解决用户在原文中提出的问题为主要参照，不得偏离或改写用户原始诉求。
+  2. 你需要围绕同一需求构建若干可能的思路或路线（至少五个），它们在关注重点上相互补充，尽量从整体上覆盖问题的主要方面，而不必强行收敛为唯一路径。
+  3. 在构思时，可以从不同视角或维度切入，形成若干具有代表性的备选思路，以减少潜在盲区，使对用户需求的回应更为全面和立体。
+  4. 你可以根据内容需要，自主选择合适的组织方式（如小标题、分段、列表等），总体上只需让人能够大致看出：
+     - 目前可能的几条主要思路或切入方向；
+     - 每条思路中相对核心的环节、关注点；
+     - 哪些地方明显存在不确定性、分歧空间或特别适合后续重点讨论。
+  5. 上述条目仅作为引导，不要求完全套用。你可以根据具体需求自由调整表达方式，只要整体上形成一个
+     “便于讨论和修改的初步方案框架”，而不是固定不变的最终结构。
 
-4. 鼓励在目标中显式标记不确定性，但只描述“要探索什么”和“探索方向”，不写出“探索结果”：
-   - 可以使用类似“提出若干假设并初步评估可行性”、“梳理不同可能机制的优劣，不作最终判断”
-     “识别当前最重要的未知量并讨论其可能范围”等表述。
+    """
 
-【角色使用要求】
-1. “讨论角色”中给出的每个角色，都应在每一轮的“计划列表”中出现一次。
-2. 输出中的 "角色名称" 必须与“讨论角色”中已有的名称或标识严格对应，不得凭空新增角色，也不得改名合并角色。
-3. 不同角色的“讨论目标”应体现分工与互补：
-   - 例如，有的角色偏理论推导，有的角色偏经验与案例，有的角色偏方法论与结构化整理等；
-   - 禁止所有角色在同一轮给出几乎相同的目标。
+    user_prompt = f"""
+# 用户需求原文
+{content}
 
-【输出格式与硬性约束】
-1. 你的回答必须是一个 JSON 数组，长度必须为 {MAX_EPCHO}。
-   - 数组中每个元素代表一轮讨论的计划。
-2. 数组中每个元素必须是结构完全一致的对象，且字段不得增删或更名：
-   - "讨论轮次序号": 整数，表示讨论轮次，从 1 开始，依次递增到 {MAX_EPCHO}。
-   - "计划列表": 数组，数组中每个元素是一个对象，表示本轮中某个角色的讨论计划。该对象的字段必须如下，且不得增删或更名：
-       - "角色名称": 字符串，对应该角色在“讨论角色”中的名称或标识。
-       - "讨论目标": 字符串数组，每个元素是一条该角色在本轮的“阶段性研究目标或探索方向”，
-         用中文描述，不要带序号或前缀，数量为 1～2 条。
-3. 所有字符串内容必须使用简体中文，禁止使用 Markdown 语法（如 #、-、* 等）以及任何形式的注释。
-   - 即使用户提供的内容中包含 Markdown 标记，你的输出中也不得使用这些标记。
+# 用于理解需求的基础知识（仅包含理解需求所必需的定义与背景）
+{knowledge}
+"""
 
-【输出规范】
- 1.输出为 JSON数组结构（UTF-8编码），以下为输出的示例（仅供你理解，不要在回答中输出本示例）：
- ```json
- [
-   {{
-     "讨论轮次序号": 1,
-     "计划列表": [
-       {{
-         "角色名称": "示例角色A",
-         "讨论目标": ["澄清与用户需求直接相关的核心概念与问题边界"]
-       }},
-       {{
-         "角色名称": "示例角色B",
-         "讨论目标": ["提出若干候选解释或模型方向，暂不做优劣判断"]
-       }}
-     ],
-     "本轮阶段性目标":["",""]
-   }}
-  ]
- ```
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt, user_prompt, no_search=False
+    )
 
-请依据“用户需求”，“用户需求解读”“可选参考资料”和“讨论角色”生成满足以上全部约束条件的完整 JSON 数组作为唯一输出。
+    solution_text = answer.strip()
+
+    return solution_text
+
+
+def update_solution_framework(
+    qwen_model: QwenModel,
+    content: str,
+    knowledge: str,
+    current_solution: str,
+    round_discussion: str,
+    stream: AIStream | None = None,
+):
+    """
+    使用“本轮讨论内容”对现有的方案框架进行更新与整合，生成新的方案框架版本。
+    - 仍然只输出方案本身（Markdown 风格纯文本）。
+    - 可以在框架中体现：本轮讨论带来的细化、当前阶段的路线选择、达成的阶段性共识等。
+    """
+
+    system_prompt = """
+# 角色与任务
+你是一名“方案框架更新助手”。你的任务是：
+在充分尊重用户原始需求的前提下，综合现有方案框架与本轮讨论内容，
+生成一个**更新后的方案框架版本**，供后续轮次继续讨论和修改。
+
+# 输入信息的优先级
+1. 用户需求原文：具有最高优先级，任何时候都不能被改写或偏离。
+2. 基础知识：用于理解需求与讨论内容的背景，不直接决定方案取向。
+3. 当前方案框架（上一版本）：是本轮更新的基础，可以被修改、重构或精简。
+4. 本轮讨论内容：用来细化、修正或调整当前方案中的思路、模块和路径选择。
+
+当“当前方案框架”与“本轮讨论内容”存在冲突时：
+- 若讨论中出现了更清晰、且与用户需求一致的观点，你可以据此**更新或替换**原有表述；
+- 对仍存在明显分歧或不确定的部分，不需要强行统一，可在框架中保留为“不同思路/备选路径”。
+
+# 可以做的事情
+1. 吸收本轮讨论中对已有部分的细化与修正：
+   - 用更清晰、更贴近讨论共识的说法，替换掉旧框架中模糊或不准确的表述。
+2. 合理调整方案结构：
+   - 可以合并、拆分或重命名原有模块，让结构更贴近当前理解；
+   - 可以增补新的模块或视角，只要它们确实来自本轮讨论且紧贴用户需求。
+3. 体现当前阶段的“路线选择”和“阶段性结论”：
+   - 允许在方案中写出“当前版本方案更倾向……”“在本轮讨论中优先考虑……”
+   - 但要保留一定弹性，不把任何选择写成不可更改的终局结论。
+
+# 禁止约束
+1. 绝对严格禁止产生任何“下一步计划”“操作指令”“实施步骤”等具有行动导向含义的内容。
+   - 不要写“接下来需要做……”“首先要……然后……最后……”
+2. 绝对严格禁止提及实验、测试、验证、上线、部署、运行或修改代码、调用外部系统等实际操作行为。
+3. 绝对严格禁止加入与用户需求无关的内容或话题，即便它在讨论中出现过。
+4. 绝对严格禁止给出终局性的结论，例如“已经证明……”“可以确定……”“最终结论是……”
+   - 可以描述为“当前阶段的共识/倾向/假设”，而不是最终决定。
+5. 避免使用带有强烈指令或要求色彩的语气（如“必须”“务必”“一定要”“需要先……”等），
+   更适合使用中性描述，比如“当前方案可以被理解为……”“目前更倾向于……”。
+
+# 更新时对讨论内容的处理思路（供参考，不是硬性结构）
+你在整合时，可以有意识地区分并处理这些信息（不需要显式分类，只是内部思考）：
+1. **对旧内容的细化或更正**：
+   - 若讨论对某个模块给出了更清晰的定义、边界或逻辑，你可以直接更新原有表述。
+2. **新的思路 / 模块 / 维度**：
+   - 若讨论引入了新的视角或模块，你可以把它们合并进方案框架中，作为新增部分。
+3. **路线选择与阶段性共识**：
+   - 若讨论在若干备选方案中出现明显倾向，可以在框架中写出“当前版本方案更关注……”
+   - 对于被弱化或暂时搁置的路径，可以简要保留为“备选思路”或直接从主干结构中移除。
+4. **分歧与不确定性**：
+   - 对于明显仍存在分歧、尚未定论的部分，可以保持描述的开放性，
+     不必强行收敛为单一路径，避免锁死后续讨论空间。
+
+# 输出形式
+1. 输出为一份**完整的、更新后的方案框架**，只需要给出最新版本的方案文本，不需要说明修改了哪些地方。
+2. 你可以自由选择小标题、分段、列表等形式来组织内容，只要整体可读、层次清晰即可。
+3. 禁止输出 JSON；禁止使用反引号和代码块标记（例如 ``` 及类似形式）。
+4. 回答从第一行到最后一行，全部视为方案内容本身，不需要加“下面是更新后的方案”之类的额外说明。
 """
 
     user_prompt = f"""
-# 用户需求（原始表述）
+# 用户需求原文
 {content}
-# 用户需求解读（供你理解结构与重点，不得改变原始需求目标）
-{user_need_profile}
-# 可选参考资料（仅用于理解背景与术语，可酌情参考，绝对不得作为研究方向参考）
-{knowledges}
-# 讨论角色
-{roles}
+
+# 用于理解需求的基础知识（仅包含理解需求所必需的定义与背景）
+{knowledge}
+
+# 当前方案框架（上一版本）
+{current_solution}
+
+# 本轮讨论内容（可能包含细化、阶段性结论和路线选择等）
+{round_discussion}
 """
 
+    # 更新方案框架时通常不再需要网络搜索，这里默认不调用外部检索
     answer, reasoning, web_content_list, references = qwen_model.do_call(
         system_prompt, user_prompt, no_search=True
     )
 
-    answer = answer.strip()
-    start_index = answer.find("[")
-    end_index = answer.rfind("]")
+    new_solution = answer.strip()
 
-    if start_index != -1 and end_index != -1:
-        answer = answer[start_index:end_index + 1]
-    else:
-        raise ValueError("无法从回答中提取JSON对象")
+    if stream is not None:
+        stream.process_chunk(new_solution + "\n")
 
-    data = json.loads(answer)
-
-    new_data=[]
-
-    for item in data:
-       new_data.append({
-           "讨论轮次序号":item["讨论轮次序号"],
-           "本轮阶段性目标":item["本轮阶段性目标"]
-       })
-
-    return new_data
-
-
-def create_report_template(qwen_model: QwenModel, content, user_need_profile, plan, knowledges, stream=None):
-    """根据需求生成最终报告模板"""
-
-    system_prompt = f"""
-你正在作为研究主持人，需要根据一次多轮理论研究讨论的整体设计，生成一份“最终研究报告”的通用章节框架。
-
-【基本信息】
-- 当前日期：{now_date}
-- 讨论模式：仅限理论研究与分析推理。
-  严禁在任何描述中假定开展或参与以下行为：
-  - 实验、测试、运行或修改代码
-  - 操作或调用任何外部系统
-  - 部署服务、执行交易或其他现实业务活动
-
-【任务目标】
-1. 该模板仅用于之后撰写理论研究结论报告的“整体章节框架”，而不是现在就给出结论。
-2. 你只需要规划有哪些章节、章节之间的大致顺序，以及每个章节在整份报告中的功能定位。
-3. 本步骤发生在正式讨论之前，不能也不应该预设任何具体研究结论、技术路线或方向选择。
-
-【章节设计原则】
-1. 章节设计应适配当前的用户需求和多轮讨论计划，使得未来讨论产生的结果可以自然地填入这些章节中。
-2. 每个章节必须有清晰的“内容要点”，用一到两句简短中文说明该章节在整份报告中的功能和作用：
-   - 仅描述“本章主要承担什么信息组织或总结任务”，例如“用于说明研究背景和问题提出的缘由”；
-   - 不写具体研究方法名称、不写具体研究方向、不写具体结论。
-3. 可以根据需要设置若干章节，但应保持结构简洁、层次清晰，避免过细拆分。
-4. 章节标题和内容要点必须具有通用性，适用于不同课题：
-   - 禁止在标题或内容要点中出现具体领域术语、产品名称、公司机构名称、数据指标、设备型号等。
-5. 章节整体设计必须以能够解决用户需求为**最终目标**而设计，因此需要包含有研究结论含义的章节；需要让人一看就知道，这是我想要的。
-
-【如何利用输入信息】
-1. “用户需求”与“用户需求解读”用于把握本次研究的大致问题类型和预期交付形态（例如偏概念梳理、偏方法评估、偏方案比较等），从而影响章节侧重，但仍需保持通用表述。
-2. “多轮讨论计划”用于推断未来讨论大致会经历哪些阶段，从而映射为报告中哪些章节需要承接这些阶段的成果。
-3. “可选参考资料”仅用于理解背景与术语，不得直接照搬其中的结论或结构到模板中。
-
-【输出格式与硬性约束】
-1. 你的回答必须是一个 JSON（UTF-8）数组,输出格式示例如下,请严格遵守如下示例的格式：
-   ```json
-     [
-      {{
-          "章节序号":1,
-          "章节标题":"",
-          "内容要点":""
-      }}
-     ]
-   ```
-   
-2. 数组中每个元素必须是结构完全一致的对象，字段不得增删或更名：
-   - "章节序号": 整数，从 1 开始递增。
-   - "章节标题": 字符串，使用中性、可复用的中文标题，例如“研究背景与问题提出”“理论基础与核心概念”“分析路径与论证思路”“结论概要与研究局限”“后续研究方向与建议”等，不得包含具体领域名称或技术名词。
-   - "内容要点": 字符串，用一到两句简短中文概括本章节在整份报告中的功能与目标，
-     只描述“该章用于做什么类型的整理或总结”，不写具体结论，不写具体研究方向或方法名称。
-3. 所有字符串内容必须使用简体中文，禁止使用 Markdown 语法（如 #、-、* 等）以及任何形式的注释。
-4. 模板中不得出现具体研究结论、具体数值、真实机构名称或虚构的研究成果，只能描述“章节应该承担什么类型的内容功能”。
-
-请依据“用户需求”“用户需求解读”“多轮讨论计划”和“可选参考资料”生成满足以上全部约束条件的报告模板 JSON 数组作为唯一输出。
-"""
-
-    user_prompt = f"""
-# 用户需求（原始表述）
-{content}
-
-# 用户需求解读（供你理解结构与重点，不得改变原始需求目标）
-{user_need_profile}
-
-# 多轮讨论计划（阶段性研究目标与角色分工大纲）
-{plan}
-
-# 可选参考资料（仅用于理解背景与术语，可酌情参考）
-{knowledges}
-"""
-
-    answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt, user_prompt, no_search=True
-    )
-
-    answer = answer.strip()
-    start_index = answer.find("[")
-    end_index = answer.rfind("]")
-
-    if start_index != -1 and end_index != -1:
-        answer = answer[start_index:end_index + 1]
-    else:
-        raise ValueError("无法从回答中提取JSON对象")
-
-    data = json.loads(answer)
-
-    return data
+    return new_solution
 
 
 
-
-
-
-def create_roles(qwen_model: QwenModel, content,user_need_profile, knowledges, stream=None):
-    """根据需求生成研究员角色。"""
+def create_roles(qwen_model: QwenModel, content, knowledges, stream=None):
+    """根据用户需求生成研究员角色（性格 + 思维特长，通用化表述）。"""
     
     system_prompt = f"""
-你正在组织一次多智能体理论研究讨论，需要按照以下约束生成 {ROLE_COUNT} 位研究员角色，用于后续多轮推理和观点碰撞。
+你正在组织一次多智能体理论研究讨论，需要生成固定数量（{ROLE_COUNT} 位）的研究员角色，
+用于后续多轮推理和观点碰撞。
 
 ## 基本信息
 - 当前日期：{now_date}
-- 讨论模式：仅限理论研究与分析推理，**禁止**假定开展或参与任何形式的实验、测试、运行代码、操作系统、部署或现实业务活动。
+- 讨论模式：仅限理论研究与分析推理。
+- 禁止在任何角色设定中假定开展或参与实验、测试、运行代码、操作系统、部署或现实业务活动。
 
-## 角色构成约束
-1. 角色职业必须为在现实中合理存在被大众所知的职业，禁止任何虚构；且职业范围必须在“用户需求”所界定的主题和范围内。
-2. 角色的职业方向必须从“用户需求”中**归纳推导**，不得脱离需求随意虚构与当前任务明显无关的领域。
-3. 整体角色集合在视角和方法上应尽量形成互补，在问题理解方式、关注重点、推理习惯等方面存在差异，而不是简单重复同一种思考方式。
-4. 允许不同角色具有相同或相近的职业称谓，但在以下方面必须有明显区分：
-   - 性格特征与表达风格；
-   - 关注的问题侧重点或分析路径。
-5. 所有角色的职责应以“思考、分析、论证、评估、解释”为核心，**不得**以“执行实验、开展测试、落地实施、操作系统或设备”等现实行动为主要职责。
-6. 可以参考提供的知识库理解背景，但不得直接照搬其中已有结论，将其包装成角色的既定立场。
-7. 默认使用中文姓名和中文语境；如用户需求中明确指定了语言或地区要求，则角色背景可以适度贴合，但仍需服务于当前任务。
-8. 所有角色必须基于当前理论研究尚未有任何结论的情况下制定，绝对不得产生会使得理论研究具有偏向性的角色。
-9. 角色性格特征，主要包含以下几个方面：
-   a.能够深化研究细节。
-   b.能够推进研究进度，避免研究出现迟滞。
-   c.能够对研究有谨慎的态度，提示研究不易被察觉的风险和注意点。
-   d.能够有一些创新思维。
+## 角色设计原则
+1. 所有角色的共同目标是：从不同思路出发，帮助更好地理解并解决当前用户需求。
+2. 整体角色集合在视角和方法上应尽量形成互补：
+   - 在问题理解方式、关注重点、推理习惯等方面存在差异；
+   - 避免产生一组思维方式高度类似、只会重复的角色。
+3. 每个角色通过“性格特征”和“思维特长”的组合来区分：
+   - 性格特征体现其稳定的思考方式和沟通风格；
+   - 思维特长体现其在推理、分析或整合方面相对突出的能力。
+4. 思维特长需要有助于解决用户需求，但应保持为抽象的能力维度，不得是具体行业技能或岗位职能。
+5. 严禁使用职业、职称、学科、研究方向、行业标签等描述角色，不得出现任何岗位称谓。
+6. 所有角色的职责都以思考、分析、论证、评估、解释为核心，不围绕现实世界中的执行行为设定。
+7. 可以参考提供的知识库理解背景，但不得把其中已有结论写成角色的预设立场或偏见。
+8. 所有角色都应在“当前尚无最终结论”的前提下被设计，不预设任何固定答案或路线选择。
+
+## 关于 personality 字段的约束
+1. personality 只描述角色的性格特征和思维特长，使用通用语言，不绑定任何具体领域或问题场景。
+2. personality 不得包含用户需求或参考资料中的专有名词、产品名称、格式名称、系统名称、算法名称等任务特定术语。
+3. personality 不得描述与当前任务中具体对象、方案、路径相关的细节情景，不出现“在分析某对象时会怎样”这类表述。
+4. personality 不得包含对当前任务中任何方案、路径或结论的评价、倾向或判断，不得暗含“已经更偏好某条路线”。
+5. personality 中的思维特长应体现为稳定的认知能力和处理问题的方式，例如是否更偏向结构化、抽象化、整合、多角度对比、关注前提条件等，
+   但不需要也不允许引用具体任务内容。
+6. 性格与思维特长应同时满足：
+   - 有能力把研究细节向更深层推进；
+   - 有能力推动讨论继续向前发展；
+   - 能保持一定的谨慎，关注容易被忽略的风险和前提条件；
+   - 保留开放性和创造力，为后续讨论留出新的角度。
 
 ## 输出格式
 - 只输出 JSON 数组，长度固定为 {ROLE_COUNT}，不得添加任何额外说明文字。
-- 数组中每个元素为一个对象，字段严格限定为：
-  - "role_name"：姓名（虚构）。
-  - "role_job"：职业（必须是现实中存在的职业，且经历资深的，不必说明研究专长）。
-  - "personality"：性格特征（主要是体现研究风格，要求：只要是现实中存在的，无其他特殊禁忌）。
+- 数组中每个元素必须是一个对象，字段严格限定为：
+  - "role_name"：姓名（虚构、中文语境即可）。
+  - "personality"：性格与思维特长的综合描述，使用一小段自然语言完成表述。
+- "personality" 必须为通用表述，不得包含具体研究领域、技术路线、行业名称、岗位称谓或任务中特定名词。
 """
 
     user_prompt = f"""
@@ -274,28 +232,15 @@ def create_roles(qwen_model: QwenModel, content,user_need_profile, knowledges, s
 {content}
 ```
 
-#用户需求解读
-```
-{user_need_profile}
-```
-
 # 可选参考资料
 ```
 {knowledges}
 ```
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
 """
+
+    answer, reasoning, web_content_list, references = qwen_model.do_call(
+        system_prompt, user_prompt, no_search=True
+    )
 
     answer, reasoning, web_content_list, references = qwen_model.do_call(
         system_prompt, user_prompt, no_search=True
@@ -314,6 +259,8 @@ def create_roles(qwen_model: QwenModel, content,user_need_profile, knowledges, s
 
     for role in data:
         role["role_id"] = str(uuid.uuid4())
+        role["role_job"] = ""  # 占位以兼容后续流程，不提供任何职业信息
+        role["personality"] = role.get("personality", "")
 
     if stream:
         description = ""
@@ -321,148 +268,12 @@ def create_roles(qwen_model: QwenModel, content,user_need_profile, knowledges, s
             description += (
                 f"角色ID:{role['role_id']}\n"
                 f"角色：{role['role_name']}\n"
-                f"职业：{role['role_job']}\n"
                 f"性格：{role['personality']}\n\n"
             )
         stream.process_chunk(f"角色：\n{description}\n")
 
     return data
 
-
-def rrange_knowledge(qwen_model: QwenModel, knowledges, references, user_content):
-    """整理初始知识库并生成统一检索策略与需求解读。"""
-
-    structure_example = """```
-{
-  "知识整理": "Markdown 结构化内容，突出概念、定义、法规、现状数据与案例",
-  "userNeedInsights": {
-    "期望交付形态": "用户期望的交付形态，例如《xx对比报告》",
-    "研究核心目标": ["目标1", "目标2"],
-    "研究范围":"根据用户需求明确严格限定讨论的范围",
-    "必须回答的细节": ["必须回答的细节、指标口径、量化要求"],
-    "用户提供的既有知识或数据来源": ["用户提供的既有知识或数据来源（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"],
-    "用户提供的参考": ["用户指定的参考方向/方法/范围/比较维度（若有），可作为可靠信息，必须详细、细致的描述，不得遗漏用户需求中任何细节"]
-  },
-  "searchFocusProfile": {
-    "timeliness": {"level": "高", "reason": "说明原因"},
-    "compliance": {"level": "中", "reason": "说明原因"},
-    "experience": {"level": "低", "reason": "说明原因"},
-    "innovation": {"level": "中", "reason": "说明原因"},
-    "efficiency": {"level": "高", "reason": "说明原因"},
-  },
-  "removalHints": ["需要剔除的原文句子，可为空数组"]
-}
-```"""
-
-    system_prompt = f"""
-你是资料整理与需求解读专家，需要把最新检索结果沉淀为可复核的知识基线，并同步输出检索策略与交付预期。
-
-## 当前日期
-- {now_date}
-
-## 用户需求
-```
-{user_content}
-```
-
-## 知识基线分栏要求
-- **指标与规范定义**：逐条写明指标名称、口径、计算方法、适用场景与来源时间，杜绝混用。
-- **监管 / 行业约束**：法规、标准、政策条款，注明发布机构与生效时间。
-- **现状数据与趋势**：仅保留帮助理解问题的数据，写清采集区间、单位、来源脚本或接口。
-- **典型案例 / 风险**：概述事实、相关主体与时间，说明对本课题的启示或争议。
-- 禁止写“推荐/建议/方案/行动计划”等指令性内容，基础知识库只保留理解所需的事实与概念。
-
-## 工作内容
- 1. 过滤掉所有主观推断、推荐与无法追溯的描述，仅保留能让后续模型理解问题的背景、定义与事实。
- 2. 细致拆解用户需求：除了交付形式、目标、细节，还需记录用户已给出的知识、引用、研究方向或假设，保证 `userNeedInsights` 足够支撑后续讨论而无需再引用原始需求。
-
-## 输出结构
-严格输出 UTF-8 JSON（不可包含反引号），参考下方示例：
-{structure_example}
-
-## 特别说明（防止网络资料篡改用户需求）
-1. 在生成 `"userNeedInsights"` 时，必须以上方“用户需求”原文为唯一依据：
-   - 只允许对用户原文进行**忠实的概括与结构化拆分**；
-   - 绝对禁止根据“网络搜索结果”或“相关引用”擅自增加、删减或改写用户的目标、范围、约束和交付形态。
-2. 当用户原文与网络资料存在不一致或冲突时：
-   - 一律以用户原文为准；
-   - 你可以在“知识整理”中说明“与部分公开资料存在差异”，但**严禁**据此修改 `"userNeedInsights"` 中的任何字段。
-3. “网络搜索结果”和“相关引用”仅能用于：
-   - 帮助你理解用户提到的术语、背景和常见做法；
-   - 补充客观事实到“知识整理”部分；
-   它们**不能**被写入 `"userNeedInsights"` 当作“用户的真实需求”或“用户明确提出的约束条件”。
-4. `"userNeedInsights"` 中的每一条内容都必须满足：
-   - 能在用户原始表述中找到对应句子，或是对此的中性、保守概括；
-   - 对于仅来自你推断或网络资料的内容，禁止写入 `"userNeedInsights"`。如确有必要，可在“知识整理”或“待补充信息”中以“推测/常见情况”前缀标注。
-
-## 数据约束
-- 严禁编造来源、作者、年份、DOI、百分比、公司名称等“看似真实”的细节，禁止伪造工具调用记录。
-- 若证据不足，使用“信息不足，以下为合理推测”，并说明假设条件。
-- 不得引用与任务无关的故事或推荐性结论。
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-    """
-
-    user_prompt = f"""
-# 网络搜索结果
-```json
-{json.dumps(knowledges, ensure_ascii=False, indent=2)}
-```
-
-# 相关引用
-```json
-{json.dumps(references, ensure_ascii=False, indent=2)}
-```
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业A/B 数据、公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-"""
-
-    answer, reasoning, web_content_list, reference_list = qwen_model.do_call(
-        system_prompt, user_prompt, no_search=True, inner_search=True
-    )
-
-    cleaned = answer.strip()
-    start_index = cleaned.find("{")
-    end_index = cleaned.rfind("}")
-    if start_index != -1 and end_index != -1 and end_index >= start_index:
-        cleaned = cleaned[start_index:end_index + 1]
-
-    payload = json.loads(cleaned)
-    knowledge_text = payload.get("知识整理", "").strip()
-    user_need_profile = payload.get("userNeedInsights", {})
-    search_focus_profile = payload.get("searchFocusProfile", {})
-    removal_hints = payload.get("removalHints", []) or []
-
-    if removal_hints and knowledge_text:
-        knowledge_text = prune_knowledge_sections(knowledge_text, removal_hints)
-
-    knowledge_text = sanitize_knowledge_base(knowledge_text)
-
-    return (
-        knowledge_text,
-        json.dumps(search_focus_profile, ensure_ascii=False, indent=2),
-        json.dumps(user_need_profile, ensure_ascii=False, indent=2),
-    )
 
 def prune_knowledge_sections(knowledge_text, removal_snippets):
     """根据提示剔除已被证伪或存疑的知识片段。"""
@@ -481,59 +292,39 @@ def prune_knowledge_sections(knowledge_text, removal_snippets):
     return updated_text
 
 
-def sanitize_knowledge_base(knowledge_text):
-    """剔除推荐、方案类内容，仅保留理解所需信息。"""
-
-    if not knowledge_text:
-        return knowledge_text
-
-    drop_keywords = ("推荐", "建议", "方案", "行动", "路径", "推广", "部署", "购买", "投资")
-    lines = []
-    for line in knowledge_text.splitlines():
-        raw_line = line.strip()
-        if not raw_line:
-            continue
-        if any(keyword in raw_line for keyword in drop_keywords):
-            continue
-        lines.append(line)
-    return "\n".join(lines).strip()
-
 
 def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     """整体会议流程入口。"""
     print("\n\n用户需求:", content, "\n\n")
-
-    knowledges = None
-    knowledges, refs = create_webquestion_from_user(
-        qwen_model, content, knowledges, now_date
-    )
     
-    while True:
-     try:
-      know_data, search_focus, user_need_profile = rrange_knowledge(
-        qwen_model, knowledges, refs, content
-      )
-      break
-     except Exception:
-      print("\n出现返回错误，资料重新整理\n")
-      time.sleep(60)
-      continue
-      
+    print("\n====正在解读用户需求，构建基础知识库====\n")
+    know_list,refs=create_webquestion_from_user(qwen_model,content,now_date)
 
-    print("\n\n基础资料:\n\n", know_data)
-    print("\n\n重点关注要素:\n\n", search_focus)
-    print("\n\n用户需求解读:\n\n", user_need_profile)
+    knowledge_content=rrange_knowledge(qwen_model,know_list,refs,now_date,content)
 
-    roles = create_roles(qwen_model, content,user_need_profile, know_data, stream=stream)
+    print(knowledge_content)
 
-    plan = create_plan(qwen_model,content,user_need_profile,know_data,roles,stream=stream)
+    print("\n====基础知识库构建完成====\n")
+    time.sleep(5)
 
-    print("\n\n用户讨论大纲:\n\n", plan)
+    print("\n====初步方案构建====\n")
 
-    report_template = create_report_template(qwen_model,content,user_need_profile,know_data,plan,stream=stream)
+    solution_text = create_initial_solution(qwen_model,content,knowledge_content)
+
+    print(solution_text)
+
+    print("\n====初步方案构建完成====\n")
+
+    print("\n====构建角色====\n")
+
+    roles = create_roles(qwen_model, content, knowledge_content, stream=stream)
+
+    print("\n====角色构建完成====\n")
     
-    print("\n\n最终报告模板:\n\n", report_template)
+    time.sleep(5)
+    print("\n====开始讨论====\n")
 
+    
     epcho = 1
     his_nodes = []
     pending_removals = []
@@ -541,99 +332,154 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     while epcho <= MAX_EPCHO:
         round_record = f"""
         [第{epcho}轮讨论开始]
-
-
         """
-        plan_item = next((p for p in plan if p["讨论轮次序号"] == epcho), None)
-            
-        if plan_item:
-            round_goals = plan_item.get("本轮阶段性目标", [])
-        else:
-            print(f"未能获取当前轮次:{epcho}讨论目标，讨论中止")
-            break
-
         for role_index, role in enumerate(roles):
             if stream:
                 stream.process_chunk(
-                    f"\n\n角色：{role['role_name']}\n职业：{role['role_job']}\n性格：{role['personality']}\n\n"
+                    f"\n\n角色：{role['role_name']}\n性格和思维特长：{role['personality']}\n\n"
                 )
             
+            round_record, role_answer=role_dissucess(qwen_model,content,round_record,solution_text,now_date,role,knowledge_content,epcho,role_index,len(roles),MAX_EPCHO,stream)
+        
+        epcho+=1
+            
 
-            new_record, role_answer = role_dissucess(
-                qwen_model,
-                content,
-                his_nodes,
-                round_record,
-                know_data,
-                search_focus,
-                user_need_profile,
-                now_date,
-                role,
-                epcho,
-                role_index,
-                MAX_EPCHO,
-                round_goals,
-                stream=stream,
-            )
-            round_record = new_record
+    
 
-        print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
 
-        msg_content = summary_round(
-            qwen_model, user_need_profile, now_date, round_record, epcho, search_focus
-        )
+    return None
 
-        sugg_text, can_end = summary_sugg(
-            qwen_model,
-            user_need_profile,
-            now_date,
-            msg_content,
-            his_nodes,
-            know_data,
-            epcho,
-            MAX_EPCHO,
-            search_focus
-        )
+    # knowledges = None
+    # knowledges, refs = create_webquestion_from_user(
+    #     qwen_model, content, knowledges, now_date
+    # )
+    
+    # while True:
+    #  try:
+    #   know_data, search_focus, user_need_profile = rrange_knowledge(
+    #     qwen_model, knowledges, refs, content
+    #   )
+    #   break
+    #  except Exception:
+    #   print("\n出现返回错误，资料重新整理\n")
+    #   time.sleep(60)
+    #   continue
+      
 
-        last_content = f"""
-        # 第{epcho}轮讨论总结
+    # print("\n\n基础资料:\n\n", know_data)
+    # print("\n\n重点关注要素:\n\n", search_focus)
+    # print("\n\n用户需求解读:\n\n", user_need_profile)
 
-        ## 当前讨论概要
-        ```
-        {msg_content}
-        ```
+    # roles = create_roles(qwen_model, content,user_need_profile, know_data, stream=stream)
 
-        ## 当前讨论进度和建议
-        ```
-        {sugg_text}
-        ```
-        """
+    # plan = create_plan(qwen_model,content,user_need_profile,know_data,roles,stream=stream)
 
-        print("\n\n====当前讨论小结====\n", last_content)
+    # print("\n\n用户讨论大纲:\n\n", plan)
 
-        his_nodes.append(last_content)
+    # report_template = create_report_template(qwen_model,content,user_need_profile,know_data,plan,stream=stream)
+    
+    # print("\n\n最终报告模板:\n\n", report_template)
 
-        if can_end:
-            print("\n====讨论中止====\n")
-            break
+    # epcho = 1
+    # his_nodes = []
+    # pending_removals = []
 
-        epcho += 1
+    # while epcho <= MAX_EPCHO:
+    #     round_record = f"""
+    #     [第{epcho}轮讨论开始]
 
-    if stream:
-        stream.process_chunk("\n[研究讨论结束]\n\n")
 
-    print("\n====输出最终报告====\n")
+    #     """
+    #     plan_item = next((p for p in plan if p["讨论轮次序号"] == epcho), None)
+            
+    #     if plan_item:
+    #         round_goals = plan_item.get("本轮阶段性目标", [])
+    #     else:
+    #         print(f"未能获取当前轮次:{epcho}讨论目标，讨论中止")
+    #         break
 
-    return summary(
-        qwen_model,
-        content,
-        now_date,
-        his_nodes,
-        know_data,
-        search_focus,
-        user_need_profile,
-        stream=stream,
-    )
+    #     for role_index, role in enumerate(roles):
+    #         if stream:
+    #             stream.process_chunk(
+    #                 f"\n\n角色：{role['role_name']}\n职业：{role['role_job']}\n性格：{role['personality']}\n\n"
+    #             )
+            
+
+    #         new_record, role_answer = role_dissucess(
+    #             qwen_model,
+    #             content,
+    #             his_nodes,
+    #             round_record,
+    #             know_data,
+    #             search_focus,
+    #             user_need_profile,
+    #             now_date,
+    #             role,
+    #             epcho,
+    #             role_index,
+    #             MAX_EPCHO,
+    #             round_goals,
+    #             stream=stream,
+    #         )
+    #         round_record = new_record
+
+    #     print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
+
+    #     msg_content = summary_round(
+    #         qwen_model, user_need_profile, now_date, round_record, epcho, search_focus
+    #     )
+
+    #     sugg_text, can_end = summary_sugg(
+    #         qwen_model,
+    #         user_need_profile,
+    #         now_date,
+    #         msg_content,
+    #         his_nodes,
+    #         know_data,
+    #         epcho,
+    #         MAX_EPCHO,
+    #         search_focus
+    #     )
+
+    #     last_content = f"""
+    #     # 第{epcho}轮讨论总结
+
+    #     ## 当前讨论概要
+    #     ```
+    #     {msg_content}
+    #     ```
+
+    #     ## 当前讨论进度和建议
+    #     ```
+    #     {sugg_text}
+    #     ```
+    #     """
+
+    #     print("\n\n====当前讨论小结====\n", last_content)
+
+    #     his_nodes.append(last_content)
+
+    #     if can_end:
+    #         print("\n====讨论中止====\n")
+    #         break
+
+    #     epcho += 1
+
+    # if stream:
+    #     stream.process_chunk("\n[研究讨论结束]\n\n")
+
+    # print("\n====输出最终报告====\n")
+
+    # return summary(
+    #     qwen_model,
+    #     content,
+    #     now_date,
+    #     his_nodes,
+    #     know_data,
+    #     search_focus,
+    #     user_need_profile,
+    #     stream=stream,
+    # )
 
 
 def summary_sugg(
