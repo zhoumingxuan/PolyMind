@@ -42,9 +42,8 @@ def create_initial_solution(qwen_model: QwenModel, content, knowledge):
   2. 如需检索，尽量将检索问题成组设计，一次性或少量批量调用，避免频繁零散调用。
   3. 每个检索问题应尽量明确时间范围、地域/主体和关键限制条件，避免语义重叠或含义重复。
   4. 严禁提出含义相同或高度等价的问题进行重复搜索。
-  5. 如引用网络数据，在信息本身包含明确来源时，可简要标注来源名称和时间；严禁虚构来源或捏造具体数字。
+  5. 如引用网络数据，在信息本身包含明确来源时，必须标注来源名称，时间；严禁虚构来源或捏造具体数字。
      对缺乏可靠来源支撑的细节，可以保持模糊或不写，禁止强行补全。
-
 # 基本信息
   1. 当前日期：{now_date}
   2. 工作模式：仅限理论研究与分析推理。
@@ -53,7 +52,11 @@ def create_initial_solution(qwen_model: QwenModel, content, knowledge):
 
 # 方案生成目标
   1. 方案需要紧贴用户需求，以解决用户在原文中提出的问题为主要参照，不得偏离或改写用户原始诉求。
-  2. 你需要围绕同一需求构建若干可能的思路或路线（至少五个），它们在关注重点上相互补充，尽量从整体上覆盖问题的主要方面，而不必强行收敛为唯一路径。
+  2. 你需要围绕同一需求构建若干可能的思路或路线（至少五个），需遵循以下要求:
+        a. 它们互不相同且逻辑自洽。
+        b. 它们能为完整解决用户需求提供研究方向/路线，而不是仅解决用户需求的一部分。
+        c. 尽可能保证视角、场景、维度覆盖全面，可行性高，不必强行收敛为唯一路径。
+
   3. 在构思时，可以从不同视角或维度切入，形成若干具有代表性的备选思路，以减少潜在盲区，使对用户需求的回应更为全面和立体。
   4. 你可以根据内容需要，自主选择合适的组织方式（如小标题、分段、列表等），总体上只需让人能够大致看出：
      - 目前可能的几条主要思路或切入方向；
@@ -66,10 +69,14 @@ def create_initial_solution(qwen_model: QwenModel, content, knowledge):
 
     user_prompt = f"""
 # 用户需求原文
+```
 {content}
+```
 
 # 用于理解需求的基础知识（仅包含理解需求所必需的定义与背景）
+```
 {knowledge}
+```
 """
 
     answer, reasoning, web_content_list, references = qwen_model.do_call(
@@ -81,7 +88,8 @@ def create_initial_solution(qwen_model: QwenModel, content, knowledge):
     return solution_text
 
 
-def update_solution_framework(
+
+def summarize_and_consolidate_solutions(
     qwen_model: QwenModel,
     content: str,
     knowledge: str,
@@ -90,92 +98,186 @@ def update_solution_framework(
     stream: AIStream | None = None,
 ):
     """
-    使用“本轮讨论内容”对现有的方案框架进行更新与整合，生成新的方案框架版本。
-    - 仍然只输出方案本身（Markdown 风格纯文本）。
-    - 可以在框架中体现：本轮讨论带来的细化、当前阶段的路线选择、达成的阶段性共识等。
+    第一轮讨论总结：将多个初步方案收敛为两个候选方案。
     """
-
     system_prompt = """
-# 角色与任务
-你是一名“方案框架更新助手”。你的任务是：
-在充分尊重用户原始需求的前提下，综合现有方案框架与本轮讨论内容，
-生成一个**更新后的方案框架版本**，供后续轮次继续讨论和修改。
+# 任务
+  1.作为本次会议主席，你的任务是在讨论结束后，对所有初步想法进行总结、提炼和收敛。
+  2.你需要将讨论中出现的多个研究方案，根据讨论的反馈，整合成**两个**逻辑清晰、具有代表性的候选方案。
 
-# 输入信息的优先级
-1. 用户需求原文：具有最高优先级，任何时候都不能被改写或偏离。
-2. 基础知识：用于理解需求与讨论内容的背景，不直接决定方案取向。
-3. 当前方案框架（上一版本）：是本轮更新的基础，可以被修改、重构或精简。
-4. 本轮讨论内容：用来细化、修正或调整当前方案中的思路、模块和路径选择。
+# 工作流程
+ 1.  **分析讨论内容**：理解研究员们对每个初步方案的评价、补充和质疑。
+ 2.  **展开数据核验**：
+     由于可能存在引用错误导致结论偏差，必须严格核验讨论中涉及的数据引用：
+     a. 对于研究员们赞同的方案，说明理由时引用的**每一条数据**都必须进行核对，不得遗漏。
+     b. 对于研究员们提出的建议，涉及的**每一条引用数据**都必须进行核对，不得遗漏。
 
-当“当前方案框架”与“本轮讨论内容”存在冲突时：
-- 若讨论中出现了更清晰、且与用户需求一致的观点，你可以据此**更新或替换**原有表述；
-- 对仍存在明显分歧或不确定的部分，不需要强行统一，可在框架中保留为“不同思路/备选路径”。
+ 3.  **争议处理**：
+     如遇研究员讨论存在争议，必须严格按照以下逻辑链处理：
+     a. **事实核查**：发起网络搜索，查明数据是真实还是虚构；只采纳引用数据为真实的研究员描述。
+     b. **视角比对**：若争议双方数据均为真实，对比思考视角，择优选取视角更全面的一方。
+     c. **深度研判**：若数据均为真实且视角均全面，发起进一步的网络搜索进行深度研究，从而判断选择哪个方向来解决争议。
 
-# 可以做的事情
-1. 吸收本轮讨论中对已有部分的细化与修正：
-   - 用更清晰、更贴近讨论共识的说法，替换掉旧框架中模糊或不准确的表述。
-2. 合理调整方案结构：
-   - 可以合并、拆分或重命名原有模块，让结构更贴近当前理解；
-   - 可以增补新的模块或视角，只要它们确实来自本轮讨论且紧贴用户需求。
-3. 体现当前阶段的“路线选择”和“阶段性结论”：
-   - 允许在方案中写出“当前版本方案更倾向……”“在本轮讨论中优先考虑……”
-   - 但要保留一定弹性，不把任何选择写成不可更改的终局结论。
+ 4.  **数据来源补充标记**：若核对之后发现数据来源缺少，需将相关数据来源进行补充填写。
+
+ 5.  **方案参考**： 回顾参考之前初步方案框架中提到的五个研究方案及其风格。
+
+ 6.   **方案整合与构建**：
+      在执行上述步骤后，构建**两个**候选方案，必须严格遵循：
+      a. **完整性**：每个方案都必须是解决用户需求的细致且完整路径，确保逻辑严密且符合事实。
+      b. **差异化**：两个方案必须基于事实构建（禁止虚构），且两者必须有非常明显的区别（技术路线、侧重点或哲学不同）。
+      c. **迭代**：吸收讨论中的有效建议，对原始方案进行修订和完善。
+
+7.   **清晰呈现**：
+     用细致、清晰、逻辑严密的结构描述这两个方案，以便下一轮进行对比。
+
+# 禁止约束（Critical）
+  1. **绝对禁止行动导向**：严禁产生“下一步计划”、“操作指令”、“实施步骤”等内容（如“接下来需要做…”、“首先…然后…”）。
+  2. **绝对禁止实操行为**：严禁提及实验、测试、验证、上线、部署、运行代码或调用外部系统。
+  3. **绝对禁止无关内容**：严禁加入与用户需求无关的话题，即使讨论中曾出现。
+  4. **绝对禁止终局定论**：
+     - 严禁暗示某方案是最终答案。
+     - 严禁使用“已证明”、“最终结论是”等措辞。
+     - 应使用“当前阶段的共识”、“目前倾向于假设”等中性描述。
+  5. **语气约束**：避免强烈指令色彩（如“务必”、“必须”），使用客观陈述语气。
+
+# 网络搜索工具说明
+  1. 如需检索，尽量将检索问题成组设计（每组搜索问题数量不限），一次性或少量批量调用，避免频繁零散调用。
+  2. 每个检索问题应尽量明确时间范围、地域/主体和关键限制条件，避免语义重叠或含义重复。
+  3. 严禁提出含义相同或高度等价的问题进行重复搜索。
+  4. 如引用网络数据，在信息本身包含明确来源时，可简要标注来源名称和时间；严禁虚构来源或捏造具体数字。
+     对缺乏可靠来源支撑的细节，可以保持模糊或不写，禁止强行补全。
+
+# 输出格式
+  1. 输出为一份完整的Markdown文档。
+  2. 文档应包含两个明确区分的方案，例如使用“方案一”和“方案二”作为标题。
+  3. 不需要解释你是如何得出这两个方案的，直接输出方案本身。
+  4. 绝对不得出现与方案无关的任何描述。
+"""  
+
+    user_prompt = f"""
+# 用户需求原文
+```
+{content}
+```
+
+# 基础知识(仅用于理解用户需求)
+```
+{knowledge}
+```
+
+# 初步方案框架（讨论前）
+```
+{current_solution}
+```
+
+# 第一轮讨论内容
+```
+{round_discussion}
+```
+"""
+    answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=False)
+    new_solution = answer.strip()
+    return new_solution
+
+
+def summarize_and_generate_report(
+    qwen_model: QwenModel,
+    content: str,
+    knowledge: str,
+    current_solution: str,
+    round_discussion: str,
+    stream: AIStream | None = None,
+):
+    """
+    第二轮讨论总结：在两个方案中选择其一，并完善成初步研究报告。
+    """
+    system_prompt = """
+# 任务
+作为会议主席，在第二轮讨论（对比两个候选方案）结束后，你的任务是：
+1.  **决策选择**：根据讨论内容，判断哪个方案得到了更多的支持或被证明更具优势。
+2.  **融合完善**：选择胜出的方案作为基础，并吸收讨论中对该方案的优化建议，以及另一方案中的合理部分。
+3.  **生成报告**：将最终完善的方案，撰写成一份结构清晰的**初步研究报告**。
+
+# 报告要求
+-   **结构完整**：报告应包含背景、问题定义、核心方案、关键论据、潜在风险等要素。
+-   **逻辑清晰**：清晰地阐述方案的内部逻辑和外部边界。
+-   **保持开放性**：虽然是初步报告，但应为后续的完善和修订留出空间，明确指出当前方案的假设和待定细节。
 
 # 禁止约束
-1. 绝对严格禁止产生任何“下一步计划”“操作指令”“实施步骤”等具有行动导向含义的内容。
-   - 不要写“接下来需要做……”“首先要……然后……最后……”
-2. 绝对严格禁止提及实验、测试、验证、上线、部署、运行或修改代码、调用外部系统等实际操作行为。
-3. 绝对严格禁止加入与用户需求无关的内容或话题，即便它在讨论中出现过。
-4. 绝对严格禁止给出终局性的结论，例如“已经证明……”“可以确定……”“最终结论是……”
-   - 可以描述为“当前阶段的共识/倾向/假设”，而不是最终决定。
-5. 避免使用带有强烈指令或要求色彩的语气（如“必须”“务必”“一定要”“需要先……”等），
-   更适合使用中性描述，比如“当前方案可以被理解为……”“目前更倾向于……”。
+1.  **避免终局性**：不要将报告描述为“最终报告”或“最终结论”。使用“初步研究报告”、“当前版本”等词语。
+2.  **禁止行动指令**：报告内容应停留在理论分析层面。
 
-# 更新时对讨论内容的处理思路（供参考，不是硬性结构）
-你在整合时，可以有意识地区分并处理这些信息（不需要显式分类，只是内部思考）：
-1. **对旧内容的细化或更正**：
-   - 若讨论对某个模块给出了更清晰的定义、边界或逻辑，你可以直接更新原有表述。
-2. **新的思路 / 模块 / 维度**：
-   - 若讨论引入了新的视角或模块，你可以把它们合并进方案框架中，作为新增部分。
-3. **路线选择与阶段性共识**：
-   - 若讨论在若干备选方案中出现明显倾向，可以在框架中写出“当前版本方案更关注……”
-   - 对于被弱化或暂时搁置的路径，可以简要保留为“备选思路”或直接从主干结构中移除。
-4. **分歧与不确定性**：
-   - 对于明显仍存在分歧、尚未定论的部分，可以保持描述的开放性，
-     不必强行收敛为单一路径，避免锁死后续讨论空间。
-
-# 输出形式
-1. 输出为一份**完整的、更新后的方案框架**，只需要给出最新版本的方案文本，不需要说明修改了哪些地方。
-2. 你可以自由选择小标题、分段、列表等形式来组织内容，只要整体可读、层次清晰即可。
-3. 禁止输出 JSON；禁止使用反引号和代码块标记（例如 ``` 及类似形式）。
-4. 回答从第一行到最后一行，全部视为方案内容本身，不需要加“下面是更新后的方案”之类的额外说明。
+# 输出格式
+- 输出为一份完整的Markdown文档，格式为一份研究报告。
+- 直接输出报告内容，无需解释决策过程。
 """
-
     user_prompt = f"""
 # 用户需求原文
 {content}
 
-# 用于理解需求的基础知识（仅包含理解需求所必需的定义与背景）
+# 基础知识
 {knowledge}
 
-# 当前方案框架（上一版本）
+# 候选方案（讨论前）
 {current_solution}
 
-# 本轮讨论内容（可能包含细化、阶段性结论和路线选择等）
+# 第二轮讨论内容
 {round_discussion}
 """
+    answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=True)
+    report = answer.strip()
+    if stream:
+        stream.process_chunk("\n\n[第二轮总结完成，已生成初步研究报告]\n\n" + report + "\n")
+    return report
 
-    # 更新方案框架时通常不再需要网络搜索，这里默认不调用外部检索
-    answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt, user_prompt, no_search=True
-    )
 
-    new_solution = answer.strip()
+def refine_report(
+    qwen_model: QwenModel,
+    content: str,
+    knowledge: str,
+    current_report: str,
+    round_discussion: str,
+    stream: AIStream | None = None,
+):
+    """
+    后续轮次：根据讨论内容，不断完善研究报告。
+    """
+    system_prompt = """
+# 任务
+作为会议记录员和编辑，你的任务是根据本轮的讨论内容，对现有的**研究报告**进行修订和完善。
 
-    if stream is not None:
-        stream.process_chunk(new_solution + "\n")
+# 工作流程
+1.  **识别修订点**：分析讨论内容，找出对报告中特定部分的修正、补充、质疑或深化。
+2.  **整合更新**：将这些讨论成果整合到报告的相应章节中，使报告内容更精确、更深入、更完善。
+3.  **保持一致性**：确保更新后的报告整体逻辑一致，结构清晰。
 
-    return new_solution
+# 禁止约束
+-   **不要颠覆性修改**：除非讨论中明确达成了需要重构的共识，否则应在现有报告框架上进行增量修改。
+-   **忠于讨论**：所有修改都应有本轮讨论作为依据。
+
+# 输出格式
+- 输出一份**完整的、更新后的研究报告**（Markdown格式）。
+- 直接输出新版报告全文，无需标出修改痕迹。
+"""
+    user_prompt = f"""
+# 用户需求原文
+{content}
+
+# 基础知识
+{knowledge}
+
+# 当前研究报告（修订前）
+{current_report}
+
+# 本轮讨论内容
+{round_discussion}
+"""
+    answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=True)
+    updated_report = answer.strip()
+    if stream:
+        stream.process_chunk("\n\n[报告修订完成]\n\n" + updated_report + "\n")
+    return updated_report
 
 
 
@@ -327,12 +429,16 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     
     epcho = 1
     his_nodes = []
-    pending_removals = []
+    # pending_removals = []
 
     while epcho <= MAX_EPCHO:
         round_record = f"""
         [第{epcho}轮讨论开始]
         """
+        print(f"\n====第{epcho}轮讨论开始====\n")
+        if stream:
+            stream.process_chunk(f"\n\n====第{epcho}轮讨论开始====\n")
+
         for role_index, role in enumerate(roles):
             if stream:
                 stream.process_chunk(
@@ -341,13 +447,40 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
             
             round_record, role_answer=role_dissucess(qwen_model,content,round_record,solution_text,now_date,role,knowledge_content,epcho,role_index,len(roles),MAX_EPCHO,stream)
         
+        print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
+        if epcho == 1:
+            # 第一轮总结：将多个初步方案收敛为两个候选方案
+            solution_text = summarize_and_consolidate_solutions(
+                qwen_model, content, knowledge_content, solution_text, round_record, stream
+            )
+            print("\n\n====第一轮总结完成，已形成两个候选方案====\n\n" + solution_text + "\n")
+            break
+            
+        elif epcho == 2:
+            # 第二轮总结：在两个方案中选择其一，并完善成初步研究报告
+            print("\n====第二轮总结：正在生成初步研究报告====\n")
+            solution_text = summarize_and_generate_report(
+                qwen_model, content, knowledge_content, solution_text, round_record, stream
+            )
+            print(solution_text)
+        else:
+            # 后续轮次：根据讨论内容，不断完善研究报告
+            print(f"\n====第{epcho}轮总结：正在修订研究报告====\n")
+            solution_text = refine_report(
+                qwen_model, content, knowledge_content, solution_text, round_record, stream
+            )
+            print(solution_text)
+
+        his_nodes.append(round_record)
         epcho+=1
             
 
     
+    print("\n\n====所有讨论已结束====\n\n")
+    if stream:
+        stream.process_chunk("\n\n====所有讨论已结束====\n\n")
 
-
-    return None
+    return solution_text
 
     # knowledges = None
     # knowledges, refs = create_webquestion_from_user(
@@ -423,7 +556,7 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     #         )
     #         round_record = new_record
 
-    #     print(f"\n\n====第{epcho}轮讨论结束，正在总结====\n\n")
+    #    
 
     #     msg_content = summary_round(
     #         qwen_model, user_need_profile, now_date, round_record, epcho, search_focus

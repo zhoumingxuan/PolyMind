@@ -145,6 +145,7 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, now_date, us
   - 指标 B：口径、单位、适用范围（仅限于理解需求必需的部分）……
   - 场景 C：一句话说明“这是哪类场景/业务”，仅为理解需求服务……
 
+
 ## 输出格式要求（非常重要，必须严格遵守）
 - 直接输出整理好的基础知识内容本身。
 - 禁止使用任何 JSON 格式。
