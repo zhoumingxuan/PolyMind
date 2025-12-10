@@ -266,16 +266,24 @@ def summarize_and_select_final_plan(
 
     user_prompt = f"""
 # 用户需求原文
+```
 {content}
+```
 
 # 基础知识（用于理解需求）
+```
 {knowledge}
+```
 
 # 候选方案
+```
 {current_solution}
+```
 
 # 当前讨论内容
+```
 {round_discussion}
+```
 """
     answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=False)
     final_plan = answer.strip()
@@ -339,13 +347,19 @@ def generate_report_from_plan(
 """
     user_prompt = f"""
 # 用户需求原文
+```
 {content}
+```
 
 # 基础知识（用于理解需求）
+```
 {knowledge}
+```
 
 # 研究方案
+```
 {final_plan}
+```
 
 """
     answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=False)
@@ -414,7 +428,7 @@ def refine_report(
 # 研究报告要求
   1. 报告**最核心内容**是为用户需求，提供完整、可靠的解决方案。
 
-  2. 报告必须严格沿“研究方案”所界定的研究方向与范围展开，基于充分的网络资料进行支撑性论证与信息整合。
+  2. 报告必须严格沿“最终研究方案”所界定的研究方向与范围展开，基于充分的网络资料进行支撑性论证与信息整合。
 
   3. 报告允许出现结论性内容，但须同时满足：
      a. 结论必须以网络检索获得的关键事实依据为支撑，且信息来源清晰、可靠；
@@ -447,19 +461,29 @@ def refine_report(
     
     user_prompt = f"""
 # 用户需求原文
+```
 {content}
+```
 
 # 基础知识（用于理解需求）
+```
 {knowledge}
+```
 
 # 最终研究方案
+```
 {final_plan}
+```
 
 # 当前研究报告（修订前）
+```
 {current_report}
+```
 
 # 本轮讨论内容
+```
 {round_discussion}
+```
 """
     answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=False)
     updated_report = answer.strip()
@@ -531,19 +555,29 @@ def evaluate_discussion_status(
 
     user_prompt = f"""
 # 用户需求原文
+```
 {content}
+```
 
 # 基础知识（用于理解需求）
+```
 {knowledge}
+```
 
 # 最终研究方案
+```
 {final_plan}
+```
 
 # 当前研究报告
+```
 {current_report}
+```
 
 # 本轮讨论内容
+```
 {round_discussion}
+```
 """
     answer, _, _, _ = qwen_model.do_call(system_prompt, user_prompt, no_search=False)
     answer = answer.strip()

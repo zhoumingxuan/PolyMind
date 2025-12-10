@@ -178,13 +178,19 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, now_date, us
 
     user_prompt = f"""
 # 用户需求原文（用于判断哪些信息与理解需求直接相关）
+```
 {user_content}
+```
 
 # 网络检索结果（供你筛选、压缩）
+```
 {json.dumps(knowledges, ensure_ascii=False, indent=2)}
+```
 
 # 相关引用（同样仅供筛选使用）
+```
 {json.dumps(references, ensure_ascii=False, indent=2)}
+```
 """
 
     answer, reasoning, web_content_list, reference_list = qwen_model.do_call(

@@ -1,76 +1,38 @@
-# PolyMind 多智体协作研究助手
+# 多智能体协作讨论研究
+PolyMind 把复杂需求分解给多名虚拟研究员，先补齐理解所需的背景知识，再经多轮协作辩论，收敛出唯一方案和结构化研究报告。
 
-PolyMind 是一个围绕“多智能体辩论 + 检索增强”构建的研究助手。它把复杂问题拆分为若干分目标，派发给具备不同专业背景的虚拟研究员，自动生成检索任务、整合外部资料，并最终产出结构化的会议纪要与后续行动建议。该版本聚焦本地运行，所有流程均由 `meeting.py` 协调。
+## 功能与目标
+- **拆题与知识补足**：自动生成检索问题、联网搜索、压缩为“刚好读懂需求”的背景，剔除推荐/行动类噪声。
+- **角色分工与对话推进**：依据配置生成带个性与思维特长的研究员，按轮次规则发言、互相质询与补证，避免重复与跑题。
+- **方案生成与收敛**：先给出多条可行思路，首轮收敛为双方案，次轮取舍统一为唯一方案，后续只做报告精修。
+- **报告生成与守护**：依据统一方案写出研究报告初稿，迭代补强；严格禁止行动导向与伪造来源，确保表述可追溯、结构化。
+- **稳健执行**：流式输出、批量检索、异常重试与节流，支持长对话与多轮讨论不中断。
 
-## 项目亮点
-- **多角色辩论驱动**：通过 `role.py` 中的角色模板批量生成研究员，自动注入人格、专业与分工，确保讨论覆盖不同视角。
-- **外部检索与知识沉淀**：`search_service.web_search` 负责统一的实时检索，结果经 `meeting.r_range_knowledge` 整理为 Markdown 知识库，再回灌到讨论链路。
-- **Prompt Guard 安全护栏**：系统 Prompt 内建多项合规约束，限制泄露敏感指标或主观臆测，适合在企业场景继续扩展。
-- **流程可拆可扩**：各阶段被封装为纯函数，能够按需挂接流式输出、中断继续或在编排系统里运行。
+## 整体逻辑链路
+1. **理解需求**：生成 question list → 联网检索 → 压缩成最小必需知识。
+2. **搭建起点**：输出多条初始方案；生成固定数量的研究员角色。
+3. **多轮协作讨论**：  
+   - **第 1 轮：摸索与对比**  
+     - 研究员要求：围绕同一需求从不同切口给出完整方案，优先覆盖未被触及的角度；必要时主动检索补证，避免主观猜测。  
+     - 处理方式：对比各方案的事实支撑与可行性，剔除无依据路径，收敛为两个候选方案。  
+   - **第 2 轮：取舍与统一**  
+     - 研究员要求：围绕两个候选方案逐条核实关键事实，提出冲突点并用检索补证或弱化；鼓励保留可融优势。  
+     - 处理方式：对照支持/反对证据和适用边界，选定唯一方案；形成报告初稿（保持理论层面，无行动指令）。  
+   - **第 3 轮及以后：报告精修与停机判断**  
+     - 研究员要求：仅在最终方案框架内补全缺口、澄清边界、补注来源，对无依据内容做降级或删除。  
+     - 处理方式：修订报告后执行停止判定；若关键维度仍缺或存在高影响争议，则继续下一轮，否则结束。
+4. **结果产出**：返回最终统一方案及对应研究报告（若未到报告阶段则返回方案文本）。
 
-## 代码结构
-- `meeting.py`：调度多轮会议的主流程，提供 `start_meeting` 等接口。
-- `api_model.py`：封装通义千问 Qwen 模型调用、工具调用与流式输出。
-- `role.py`：角色模版与质检逻辑。
-- `search_service.py`：目前仅包含 Baidu AI Search 提供方，暴露统一的 `web_search` 函数。
-- `config.py`：读取 `setting.json` 的轻量封装。
-- `setting.json`：运行所需的全部密钥与参数。
-- `test.py`：最小可运行示例，展示如何实例化模型并触发一次会议。
+## 达成的效果
+- 在有限轮次内，从模糊需求走到清晰、可解释、单一的研究方案。
+- 讨论过程可追溯：每轮有规则、有检索、有证据补强，避免主观臆断。
+- 报告结构清晰、来源可查、无行动导向，更易直接复用或二次编辑。
 
-## 工作流程
-1. **解析任务**：`start_meeting` 接收用户问题，依据 `role_count` 创建若干专长互补的研究员。
-2. **拆解检索**：模型通过工具调用生成 `question_list`，交由 `web_search` 实际检索。
-3. **知识入库**：`meeting.py` 把检索结果规整成结构化知识，附带引用信息。
-4. **多轮讨论**：在 `max_epcho` 轮内，研究员轮流发言、引用资料、修正观点。
-5. **总结与建议**：达到终止条件或轮次上限后输出会议纪要、关键证据与后续行动计划。
+## 使用方式（简）
+1. 安装依赖（Python 3.10+）：`pip install dashscope requests`
+2. 配置 `setting.json`（UTF-8）：填写 `qwen_key`、`baidu_key`，可选调整 `role_count`、`max_epcho`。
+3. 运行示例：`python test.py`，或在业务中调用 `start_meeting(model, "你的研究需求", stream)`。
 
-## 快速开始
-1. **准备环境**
-   - Python 3.10+。
-   - 可选：`python -m venv .venv && .\\.venv\\Scripts\\activate`
-2. **安装依赖**
-   ```bash
-   pip install dashscope requests
-   ```
-3. **配置 `setting.json`**
-   - 填写 Qwen（DashScope）密钥、百度千帆 AI Search 密钥。
-   - 详见下文“`setting.json` 字段说明”。
-4. **运行示例或集成到业务代码**
-   - 直接运行 `python test.py`。
-   - 或参考下列片段手动触发会议：
-     ```python
-     from api_model import QwenModel, AIStream
-     from meeting import start_meeting
-
-     stream = AIStream()
-     model = QwenModel(model_name="qwen-plus-latest")
-     report = start_meeting(model, "请围绕 XXX 制定可落地的研究计划", stream)
-     print(report)
-     ```
-
-## `setting.json` 字段说明
-| 键 | 示例/默认 | 说明 |
-| --- | --- | --- |
-| `max_epcho` | `5` | 单次会议的最大轮次，控制讨论深度与成本。 |
-| `role_count` | `5` | 初始生成的研究员数量。 |
-| `qwen_key` | `sk-***` | 通义千问 (DashScope) API Key，供 `api_model.QwenModel` 调用。 |
-| `baidu_key` | `bce-v3/...` | 百度千帆 AI Search 的 Bearer Token，用于联网检索。 |
-| `search_provider` | `baidu` | 当前版本仅支持 `baidu`，填写其它值会报错。 |
-| `dashscope_search_api_key` | 可选 | 预留字段，若以后实现 DashScope Deep Search 或自定义 Provider 可复用。 |
-| `dashscope_search_app_id` | 可选 | 同上，保留 AppID。 |
-| `dashscope_search_app_version` | `beta` | 预留字段，兼容历史配置。 |
-| `dashscope_search_endpoint` | `https://dashscope...` | 预留字段，自定义 Provider 时可复用。 |
-| `search_top_k` | `6` | 百度检索返回的 `web` 结果数量上限，越大越耗时。 |
-| `search_timeout` | `120`（未配置时默认 1200） | 搜索请求的超时时长（秒），可按网络状况调整。 |
-
-> 额外可选参数：在 `setting.json` 中添加 `search_cooldown`（默认 1 秒）可以控制请求节流；`search_retry_delay`（默认 30 秒）决定失败重试的间隔。
-
-## 搜索服务与 RAG 扩展
-- `search_service.py` 现在只保留 `BaiduAISearchProvider`，保证稳定可用。`search_provider` 必须为 `baidu`，否则 `_build_provider` 会抛出 `SearchProviderError`。
-- 若需要扩展为 **RAG**、企业私域检索或其它 API，可按以下思路：
-  1. 新建一个继承 `SearchProviderBase` 的类，实现 `_search`，在内部调用你的向量数据库、文档库或第三方 API。
-  2. 在 `_build_provider` 中注册新类，并在 `setting.json` 中新增对应的配置项。
-  3. （可选）在 `meeting.r_range_knowledge` 中追加对自建知识库字段的处理，使会议阶段能引用向量检索的命中记录。
-- RAG 方案示例：把查询向量化后，在 Milvus/Faiss 中召回段落，与实时的 Baidu 结果一起写入知识库，实现“现势资讯 + 私域知识”的混合增强。
-
-通过上述方式，本仓库可以平滑演进为更复杂的检索增强生成（RAG）平台，同时保持当前轻量、易调试的特性。
+## 注意
+- 仅内置 Baidu AI Search，请确保网络和 Token 有效。
+- 所有输出为理论研究内容，Prompt 已限制行动导向与来源伪造。
