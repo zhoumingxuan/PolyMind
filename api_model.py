@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import re
 import time
@@ -5,6 +6,7 @@ from datetime import datetime
 
 import dashscope
 import requests
+from requests.exceptions import ChunkedEncodingError, ConnectionError as RequestsConnectionError
 from urllib3.exceptions import ProtocolError
 
 from config import ConfigHelper
@@ -107,12 +109,30 @@ class QwenModel:
 
     @staticmethod
     def _safe_msg_attr(msg, attr, default=None):
+        """
+        安全读取 message 上的属性，兼容对象形式和 dict 形式。
+        """
+        if msg is None:
+            return default
+
+        # dict 形式：优先用 get
+        if isinstance(msg, dict):
+            return msg.get(attr, default)
+
+        # 对象形式：用 getattr
         try:
             return getattr(msg, attr)
-        except (AttributeError, KeyError):
+        except Exception:
             return default
 
     def do_tool_calls(self, tool_calls, messages):
+        """
+        处理所有 tool_calls：逐一执行并补回 tool 消息。
+        注意：tool 消息的 content 必须是字符串，这里统一 json.dumps。
+        """
+        all_data = []
+        all_refs = []
+
         for tool_call in tool_calls:
             func_name = tool_call["function"]["name"]
             args_data = tool_call["function"].get("arguments", "[]")
@@ -128,11 +148,17 @@ class QwenModel:
                 data_content, ref_data = search_list(**args)
                 refs.extend(ref_data)
 
-            messages.append(
-                {"role": "tool", "tool_call_id": tool_id, "content": data_content}
-            )
+            # content 必须为字符串
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_id,
+                "content": json.dumps(data_content or [], ensure_ascii=False)
+            })
 
-            return data_content, refs
+            all_data.extend(data_content or [])
+            all_refs.extend(refs or [])
+
+        return all_data, all_refs
 
     def send_messages(
         self,
@@ -143,58 +169,89 @@ class QwenModel:
         no_search: bool = False,
         inner_search: bool = False,
     ):
-        max_stream_retries = 3
+        """
+        发送消息到 DashScope 并以流式方式解析返回结果。
+
+        关键点：
+        - 支持思考模型(enable_thinking=True, incremental_output=True)。
+        - 兼容“部分 chunk 只有 usage、没有 choices”的情况。
+        - 对网络中断、限流等异常做整体重试（指数回退）。
+        - 对 400/InvalidParameter（如 content 缺失）不做无意义重试，直接抛出。
+        """
+
+        max_retries = 6
+        base_backoff = 5
+
+        # 简单的节流（防止瞬时 QPS 过高）
+        time.sleep(3)
+
+        tools_data = None if no_search else self.tools
+
         attempt = 0
+        last_exception = None
 
-        time.sleep(5)
-
-        while True:
-            response = None
-            while response is None:
-                try:
-                    response = dashscope.Generation.call(
-                        api_key=self.api_key,
-                        model=self.model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=1024 * 16,
-                        thinking_budget=1024 * 32,
-                        enable_thinking=True,
-                        tools=None if no_search else self.tools,
-                        enable_search=True if inner_search else False,  # 开启联网搜索的参数
-                        search_options={
-                            "forced_search": True,  # 强制开启联网搜索
-                            "enable_source": False,  # 使返回结果包含搜索来源的信息，OpenAI 兼容方式暂不支持返回
-                            "enable_citation": False,  # 开启角标标注功能
-                            "search_strategy": "pro"  # 模型将搜索10条互联网信息
-                        } if inner_search else None,
-                        stream=True,
-                        include_usage=True,
-                        incremental_output=True,
-                        result_format=result_format,
-                    )
-                except Exception:
-                    response = None
-                    time.sleep(60)
-                    continue
-
-            reasoning_content = []
-            answer_content = []
-            total_tokens = 0
-            tool_response = {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": []
-            }
-
-            toolcall_infos = []
-
+        while attempt < max_retries:
             try:
-                for chunk in response:
-                    msg = chunk.output.choices[0].message
+                response = dashscope.Generation.call(
+                    api_key=self.api_key,
+                    model=self.model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=1024 * 16,
+                    thinking_budget=1024 * 32,
+                    enable_thinking=True,
+                    tools=tools_data,
+                    # enable_search=True if inner_search else False,
+                    stream=True,
+                    include_usage=True,
+                    incremental_output=True,
+                    result_format=result_format,
+                )
 
-                    if chunk.get("usage"):
-                        total_tokens = chunk.usage.total_tokens
+                reasoning_content = []
+                answer_content = []
+                total_tokens = 0
+                tool_response = {
+                    "role": "assistant",
+                    "content": " ",
+                    "tool_calls": []
+                }
+                toolcall_infos = []
+
+                for chunk in response:
+                    status_code = getattr(chunk, "status_code", None)
+                    if status_code and status_code != 200:
+                        err_code = getattr(chunk, "code", None)
+                        err_msg = getattr(chunk, "message", None)
+                        raise RuntimeError(
+                            f"DashScope 流式块错误: status_code={status_code}, code={err_code}, message={err_msg}"
+                        )
+
+                    usage = getattr(chunk, "usage", None)
+                    if usage is not None:
+                        if isinstance(usage, dict):
+                            total_tokens = usage.get("total_tokens", total_tokens)
+                        else:
+                            total_tokens = getattr(usage, "total_tokens", total_tokens)
+
+                    output = getattr(chunk, "output", None)
+                    if output is None:
+                        continue
+
+                    if isinstance(output, dict):
+                        choices = output.get("choices")
+                    else:
+                        choices = getattr(output, "choices", None)
+
+                    if not choices:
+                        continue
+
+                    choice0 = choices[0]
+                    msg = None
+                    if isinstance(choice0, dict):
+                        msg = choice0.get("message") or choice0.get("delta") or {}
+                    else:
+                        msg = getattr(choice0, "message", None) or getattr(choice0, "delta", None) or {}
 
                     msg_reasoning = self._safe_msg_attr(msg, "reasoning_content", "")
                     msg_content = self._safe_msg_attr(msg, "content", "")
@@ -205,58 +262,81 @@ class QwenModel:
 
                     if msg_tool_calls:
                         for tool_call in msg_tool_calls:
-                            index = tool_call["index"]
-
+                            index = tool_call.get("index", 0)
                             while len(toolcall_infos) <= index:
                                 toolcall_infos.append({"id": "", "name": "", "arguments": ""})
 
                             if "id" in tool_call:
                                 toolcall_infos[index]["id"] += tool_call.get("id", "")
 
-                            if "function" in tool_call:
-                                func = tool_call["function"]
-                                if "name" in func:
-                                    toolcall_infos[index]["name"] += func.get("name", "")
-                                if "arguments" in func:
-                                    toolcall_infos[index]["arguments"] += func.get("arguments", "")
+                            func = tool_call.get("function") or {}
+                            if "name" in func:
+                                toolcall_infos[index]["name"] += func.get("name", "")
+                            if "arguments" in func:
+                                toolcall_infos[index]["arguments"] += func.get("arguments", "")
 
                     if msg_content:
-                        chunk_content = msg_content
                         if stream:
-                            stream.process_chunk(chunk_content)
-                        answer_content.append(chunk_content)
-            except (requests.exceptions.ChunkedEncodingError, ProtocolError):
+                            stream.process_chunk(msg_content)
+                        answer_content.append(msg_content)
+
+                self.total_tokens_count = total_tokens
+                if self.total_tokens_count > 50000:
+                    print("\n累计 tokens 已超过 50000，休眠 120s 再继续使用 DashScope")
+                    time.sleep(120)
+                    self.total_tokens_count = 0
+
+                if toolcall_infos:
+                    for t_index, tool_call in enumerate(toolcall_infos):
+                        item = {
+                            "function": {
+                                "name": tool_call["name"],
+                                "arguments": tool_call["arguments"],
+                            },
+                            "id": tool_call["id"],
+                            "index": t_index,
+                            "type": "function",
+                        }
+                        tool_response["tool_calls"].append(item)
+
+                answer_text = "".join(answer_content)
+                reasoning_text = "".join(reasoning_content)
+
+                # 关键：当存在 tool_calls 且答案文为空时，给一个最小非空占位，避免 400
+                if tool_response["tool_calls"] and not answer_text.strip():
+                    answer_text = " "  # 单空格即可满足“非空字符串”要求
+
+                tool_response["content"] = answer_text
+                tool_response["reasoning_content"] = reasoning_text
+                tool_response["usage"] = {"total_tokens": total_tokens}
+
+                return answer_text, reasoning_text, tool_response
+
+            except (ProtocolError, ChunkedEncodingError, RequestsConnectionError) as exc:
                 attempt += 1
-                if attempt >= max_stream_retries:
-                    raise RuntimeError("DashScope streaming响应多次异常终止，请稍后重试。")
-                time.sleep(2)
+                last_exception = exc
+                backoff = min(120, base_backoff * (2 ** (attempt - 1)))
+                print(
+                    f"DashScope streaming 响应异常终止（{exc}），将在 {backoff}s 后进行第 {attempt}/{max_retries} 次重试"
+                )
+                time.sleep(backoff)
+                continue
+            except Exception as exc:
+                # 对明显的 400/InvalidParameter（content 缺失/为空）不做重试
+                msg = str(exc)
+                if ("status_code=400" in msg) or ("InvalidParameter" in msg) or ("content field is a required field" in msg):
+                    raise
+
+                attempt += 1
+                last_exception = exc
+                backoff = min(120, base_backoff * (2 ** (attempt - 1)))
+                print(
+                    f"DashScope 调用/解析异常（{exc}），将在 {backoff}s 后进行第 {attempt}/{max_retries} 次重试"
+                )
+                time.sleep(backoff)
                 continue
 
-            self.total_tokens_count += total_tokens
-            if self.total_tokens_count > 50000:
-                time.sleep(60)
-                self.total_tokens_count = 0
-
-            if toolcall_infos:
-                for t_index, tool_call in enumerate(toolcall_infos):
-                    item = {
-                        "function": {
-                            "name": tool_call["name"],
-                            "arguments": tool_call["arguments"],
-                        },
-                        "id": tool_call["id"],
-                        "index": t_index,
-                        "type": "function",
-                    }
-                    tool_response["tool_calls"].append(item)
-
-            answer_text = "".join(answer_content)
-            reasoning_text = "".join(reasoning_content)
-            tool_response["content"] = answer_text
-            tool_response["reasoning_content"] = reasoning_text
-            tool_response["usage"] = {"total_tokens": total_tokens}
-
-            return answer_text, reasoning_text, tool_response
+        raise RuntimeError(f"DashScope 多次重试后仍然失败: {last_exception}")
 
     def do_call(
         self,
@@ -265,7 +345,7 @@ class QwenModel:
         stream: AIStream = None,
         temperature: float = 0.5,
         no_search: bool = False,
-        inner_search: bool = True,
+        inner_search: bool = False,
         result_format: str = "message",
     ):
         messages = [
@@ -283,15 +363,17 @@ class QwenModel:
             result_format=result_format,
         )
 
-
         references = []
         while tool_response["tool_calls"]:
+            # 直接把 tool_response 作为消息加入（沿用你早期写法的习惯）
             messages.append(tool_response)
+
             web_search_list, web_references = self.do_tool_calls(
                 tool_response["tool_calls"], messages
             )
             web_content_list.extend(web_search_list or [])
             references.extend(web_references or [])
+
             answer, reasoning, tool_response = self.send_messages(
                 messages,
                 stream,
@@ -303,98 +385,6 @@ class QwenModel:
 
         return answer, reasoning, web_content_list, references
 
-
-def create_webquestion_from_user(
-    qwen_model: QwenModel, user_message, history_search, now_date, search_focus=None
-):
-    system_prompt = f"""
-你是搜索任务规划师，负责为多智能体系统生成高质量的网络检索问题。
-
-## 基本信息
-- 当前日期：{now_date}
-
-## 任务目标
-1. 逐条解析用户需求，提炼必须查证的事实、定义、规范、数据等要点。
-2. 结合输入中出现的时间、地点、人物、事件与特别强调内容，生成可直接执行的搜索问题。
-3. 若提供历史搜索结果，需基于其中的事实识别信息缺口，避免重复查询，强化深入性问题。
-
-    ## 编写规则
-    - 问题需按“一个问题解决一个信息缺口”的原则组织，禁止冗余。
-    - 优先生成：行业规范/定义 → 关键背景/数据 → 深度洞察/争议点。
-    - 问题必须用中文，语义明确，避免泛化或含糊词。
-    - 若用户需求中包含时间约束，需与当前日期核对后再写入问题。
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-优先检索通用定义/经典做法；若来源存疑或无法核验，请在回答中注明不确定性。
-
-    ## 输出格式
-    - 严格输出原始 JSON 文本，不得附加 Markdown 代码块符号、反引号、注释、自然语言前后缀或任何非 JSON 内容。
-    - 返回 JSON 数组，每个元素包含 id（GUID）、question、time（none/week/month/semiyear/year）。
-    - 若暂无法生成搜索问题，直接输出空数组 `[]`，同样不得添加解释。
-"""
-
-    if history_search:
-        system_prompt += f"""
-## 历史搜索数据
-以下为已获取的搜索结果，可直接引用，不要重复生成同义问题：
-```json
-{json.dumps(history_search, ensure_ascii=False, indent=2)}
-```
-"""
-
-    if search_focus:
-        system_prompt += f"""
-## 搜索关注要素
-```
-{search_focus}
-```
-- 所有检索约束都要结合该配置给出的时效性、规范性、经验性、创新性与效率要求，禁止遗漏或混淆。
-"""
-
-    user_prompt = user_message
-
-    answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt, user_prompt, temperature=0.5, no_search=True
-    )
-
-    answer = answer.strip()
-    start_index = answer.find("[")
-    end_index = answer.rfind("]")
-
-    if start_index != -1 and end_index != -1:
-        answer = answer[start_index:end_index + 1]
-    else:
-        raise ValueError("无法从回答中提取JSON对象")
-
-    data = json.loads(answer)
-
-    refs = []
-    results = []
-    for item in data:
-        question = item["question"]
-        time_range = item["time"]
-
-        print("需要搜索的问题:", question, "\n\n")
-        web_content, ref_items = web_search(question, time_range)
-
-        refs.extend(ref_items)
-
-        results.append({
-            "question": question,
-            "result": web_content
-        })
-
-    return results, refs
 
 
 def search_list(question_list):
@@ -422,7 +412,7 @@ def search_list(question_list):
             continue
         time_range = item.get("time", "none")
 
-        print("需要搜索的问题:", question, "\n\n")
+        print("正在搜索的问题:", question, "\n")
         web_content, refs_items = web_search(question, time_range)
 
         results.append({
@@ -432,169 +422,3 @@ def search_list(question_list):
         refs.extend(refs_items)
 
     return results, refs
-
-
-def update_knowledge(qwen_model: QwenModel, now_date, content, history_know, know_list, references):
-    system_prompt = f"""
-你是知识整理专家，负责将最新搜索内容沉淀为可追溯的知识。
-
-## 当前日期
-- {now_date}
-
-## 用户需求
-```
-{content}
-```
-
-## 工作流程
-1. **过滤**：剔除纯结论/建议/计划类语句，仅保留与需求高度相关且可追溯的信息。
-2. **归纳**：对过滤后的内容去重、分类、概括，并保留关键事实（人物、地点、时间、数值、来源）。
-3. **缺失**：记录仍未找到的信息及缺失原因。
-
-## 输出结构
-必须严格按以下章节输出（无内容时写“（无）”）：
-- 名词解释
-- 规范
-- 相关数据
-- 新闻事件
-- 论文参考
-- 示例
-- 其他知识
-- 未找到的信息
-
-    ## 约束
-    - 每条信息需注明至少两个可核验要素（如来源+时间、来源+作者等），禁止虚构。
-    - 若资料存疑或来源缺失，应明确提示。
-    - 不允许混淆“原始知识库”与“最新搜索结果”，请以事实准确为唯一优先级。
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-    """
-
-    user_prompt = f"""
-# 既有知识
-```
-{history_know}
-```
-
-# 最新网络搜索结果
-```json
-{json.dumps(know_list, ensure_ascii=False, indent=2)}
-```
-
-# 相关引用
-```json
-{json.dumps(references, ensure_ascii=False, indent=2)}
-```
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文/会议/作者/年份/DOI/百分比提升/工业A/B数据/公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但**仅用于通用概念与背景说明**；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-"""
-
-    answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt,
-        user_prompt,
-        temperature=0.5,
-        no_search=True,
-        inner_search=True,
-    )
-
-    return answer.strip()
-
-
-def verify_knowledge_post_speech(qwen_model: QwenModel, now_date, role_answer, history_know):
-    system_prompt = f"""
-你是知识稽核员，负责根据研究员的最新发言（尤其是核验结论）整理当前知识库。
-
-## 当前日期
-- {now_date}
-
-## 稽核任务
-1. 解析发言中的核验链（核验对象/结论/证据/交接要点），识别哪些知识被确认通过、被判错或仍待补证。
-2. 将被判错、来源缺失或时间失效的条目移入“已淘汰知识”，并写明淘汰原因及涉及的来源、时间戳。
-3. 保留已核验通过与尚未覆盖的条目，完整继承其来源网站/出版方、作者或责任团队、采集脚本或接口、时间戳或统计区间等元数据。
-4. 对仍待补证的内容，在“待补充信息”中列出缺失字段、建议的下一步核验动作及期望来源；不得凭空新增知识。
-
-## 输出结构
-保持以下章节顺序（无内容写“（无）”）：
-- 名词解释
-- 规范
-- 相关数据
-- 新闻事件
-- 论文参考
-- 示例
-- 其他知识
-- 未找到的信息
-- 方法与规范
-- 事件与案例
-- 已淘汰知识（含淘汰原因与原来源）
-
-    ## 约束
-    - 禁止使用“搜索结果1/引用2/来源A”等编号占位，必须写出真实来源并保持 UTF-8 编码。
-    - 若发言仅给出估计或尚未核验的判断，需标注“信息不足，以下为合理推测”并说明假设条件。
-    - 不得删除发言未提及且尚未核验的知识；所有调整必须由发言内容与既有知识共同支撑。
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-    """
-
-    user_prompt = f"""
-# 当前知识库
-```
-{history_know}
-```
-
-# 研究员发言
-```
-{role_answer}
-```
-
-[[PROMPT-GUARD v1 START]]
-【严禁虚构与跑题（硬性约束）】
-- 禁止编造具体论文、会议、作者、年份、DOI、百分比、工业 A/B 数据、公司名称等“看似真实”的细节。
-- 仅可用“有研究指出/可能/推测/一般做法是……”等模糊表述指代外部工作；不得出现具体标题或精确数字。
-- 允许使用网络搜索/外部资料，但仅用于通用概念与背景说明；不得将外部资料写成“本项目的真实结果”。
-- 不得讲与任务无关的行业故事。
-
-【信息不足时的处理】
-- 若证据不足，请明确写“信息不足，以下为合理推测”，而非下确定结论。
-
-[[PROMPT-GUARD v1 END]]
-    """
-
-    answer, reasoning, web_content_list, references = qwen_model.do_call(
-        system_prompt,
-        user_prompt,
-        temperature=0.3,
-        no_search=True,
-        inner_search=True,
-    )
-
-    return answer.strip()
