@@ -1,155 +1,95 @@
-import time
-from typing import Dict, List, Tuple
+# -*- coding: utf-8 -*-
+import os
+import sys
 
-import requests
+sys.path.append(os.path.dirname(__file__))
 
-from config import ConfigHelper
+from api_model import AIStream, QwenModel
+from meeting import start_meeting
 
-config = ConfigHelper()
-
-RECENCY_HINT = {
-    "week": "最近7天",
-    "month": "最近30天",
-    "semiyear": "最近180天",
-    "year": "最近365天",
+# 预置几个受大众关注的课题（A 股选股/板块趋势、系统架构），便于快速演示多智能体研究流程。
+RESEARCH_TOPICS = {
+    "a_share_stock_pick": {
+        "title": "A 股多因子选股与推荐（含投资建议）",
+        "description": "结合行业景气、财报质量、量价与事件/舆情信号，形成可解释的股票推荐与配置建议。",
+        "content": """
+面向中国 A 股（沪深市场）的多因子选股与推荐：
+- 目标：基于行业景气度、财报与现金流质量、量价动量、公告/新闻/研报舆情，形成可解释的股票候选清单与仓位建议。
+- 约束：覆盖大盘/中盘/小盘与流动性要求，控制单票/行业/风格暴露；需给出逻辑、数据来源、风险提示与止盈止损思路。
+- 输出：列出推荐股票及理由，给出仓位建议和风险场景（可包含备用观察名单）。
+""",
+    },
+    "a_share_sector_trend": {
+        "title": "A 股未来热门板块与行情趋势研究（含配置建议）",
+        "description": "研判未来 3-12 个月可能走强的板块与题材，给出配置比例与风险对冲思路。",
+        "content": """
+研究未来 3-12 个月可能走强的 A 股板块与题材，并形成配置建议：
+- 维度：宏观与政策动向、产业链景气度、估值与资金偏好、外部事件（地缘/供需/技术周期）。
+- 约束：给出板块/主题的配置比例建议，明确进场/减仓信号，提示高波动或监管风险；可提供代表性成分股示例。
+- 输出：板块排序、配置建议、代表性标的示例、风险对冲思路。
+""",
+    },
+    "ecommerce_arch": {
+        "title": "大型电商高并发架构演进方案",
+        "description": "面向大促/秒杀场景的高并发、高可用、弹性与降本架构设计。",
+        "content": """
+为大型电商平台设计高并发架构演进方案：
+- 场景：大促/秒杀、库存扣减、订单支付、风控、推荐/搜索的稳定性与延迟控制。
+- 约束：异地多活/容灾、降级限流策略、缓存与消息削峰、灰度与回滚；兼顾成本与可观测性。
+- 指标：峰值 QPS、尾延迟、可用性 SLA、故障恢复时间、资源成本与容量预测。
+""",
+    },
+    "observability_platform": {
+        "title": "全链路可观测性与 SLO 平台方案",
+        "description": "构建日志/指标/链路追踪统一的可观测性与 SLO 治理平台。",
+        "content": """
+设计面向中大型系统的可观测性平台：
+- 需求：日志/指标/链路追踪统一采集与关联，SLO/错误预算治理，异常检测与告警降噪。
+- 约束：多云/混合部署、数据留存与成本优化、敏感数据脱敏与合规；支持多语言与多运行时。
+- 指标：监控覆盖度、告警噪音率、定位耗时、SLO 达成率、存储/计算成本。
+""",
+    },
 }
 
 
-class SearchProviderError(RuntimeError):
-    """网络搜索提供方异常。"""
+def list_topics() -> None:
+    """打印可选课题及简介。"""
+    print("可选课题（键：标题 —— 简介）：")
+    for key, meta in RESEARCH_TOPICS.items():
+        print(f"- {key}: {meta['title']} —— {meta['description']}")
 
 
-class SearchProviderBase:
-    """所有搜索提供方的公共实现。"""
+def pick_topic(args: list[str]):
+    """
+    根据命令行参数选择课题；支持:
+    - `python test.py`           直接运行默认课题
+    - `python test.py list`      列出全部课题
+    - `python test.py <key>`     运行指定课题
+    """
+    if len(args) >= 2:
+        key = args[1].strip()
+        if key.lower() == "list":
+            list_topics()
+            sys.exit(0)
+        if key not in RESEARCH_TOPICS:
+            print(f"未找到课题 '{key}'，可选：{', '.join(RESEARCH_TOPICS.keys())}")
+            sys.exit(1)
+        return key, RESEARCH_TOPICS[key]
 
-    NAME = "base"
-
-    def __init__(self, cfg: ConfigHelper):
-        self.cfg = cfg
-        self._cache: Dict[str, Tuple[str, List[Dict]]] = {}
-        self.cooldown = float(cfg.get("search_cooldown", 1.0) or 1.0)
-        self.retry_delay = int(cfg.get("search_retry_delay", 60) or 60)
-
-    def _cache_key(self, question: str, time_filter: str) -> str:
-        return f"{question.strip()}|||{time_filter or 'none'}"
-
-    def _from_cache(self, question: str, time_filter: str):
-        key = self._cache_key(question, time_filter)
-        return self._cache.get(key)
-
-    def _store_cache(self, question: str, time_filter: str, data):
-        key = self._cache_key(question, time_filter)
-        self._cache[key] = data
-
-    def search(self, question: str, time_filter: str = "none"):
-        """统一的外部调用入口，带缓存与简单退避。"""
-        cached = self._from_cache(question, time_filter)
-        if cached:
-            return cached
-
-        try:
-            result = self._search(question, time_filter)
-        except Exception:  # pylint: disable=broad-except
-            time.sleep(self.retry_delay)
-            result = self._search(question, time_filter)
-
-        self._store_cache(question, time_filter, result)
-        if self.cooldown:
-            time.sleep(self.cooldown)
-        return result
-
-    def _search(self, question: str, time_filter: str):
-        raise NotImplementedError
-
-    @staticmethod
-    def _apply_recency_hint(question: str, time_filter: str) -> str:
-        if not time_filter or time_filter == "none":
-            return question
-        hint = RECENCY_HINT.get(time_filter, "")
-        if not hint:
-            return question
-        return f"{question}（限定{hint}范围）"
+    default_key = next(iter(RESEARCH_TOPICS))
+    return default_key, RESEARCH_TOPICS[default_key]
 
 
-class BaiduAISearchProvider(SearchProviderBase):
-    """百度千帆智能搜索适配实现。"""
+def main():
+    topic_key, topic_meta = pick_topic(sys.argv)
+    print(f"\n即将启动课题：{topic_meta['title']} ({topic_key})\n{topic_meta['description']}\n")
 
-    NAME = "baidu"
+    stream = AIStream()
+    qwen_model = QwenModel(model_name="qwen3-max")
 
-    def __init__(self, cfg: ConfigHelper):
-        super().__init__(cfg)
-        self.api_key = cfg.get("baidu_key")
-        self.top_k = int(cfg.get("search_top_k", 6) or 6)
-        self.url = "https://qianfan.baidubce.com/v2/ai_search/chat/completions"
-        self.timeout = int(cfg.get("search_timeout", 1200) or 1200)
-        if not self.api_key:
-            raise SearchProviderError("缺少 Baidu AI Search 鉴权。")
-
-    def _search(self, question: str, time_filter: str):
-        time.sleep(3)
-        query = self._apply_recency_hint(question, time_filter)
-        body = {
-            "messages": [{"role": "user", "content": query}],
-            "search_source": "baidu_search_v2",
-            "search_mode": "required",
-            "temperature": 0.4,
-            "instruction": (
-                "【任务】围绕查询问题逐条归纳检索结果，不得输出建议或计划。\n"
-                "【要求】\n"
-                "1. 每条信息都要给出准确来源（网站名称+文章标题+URL）。\n"
-                "2. 明确写出时间、地点、人物等关键要素，保持与原文一致。\n"
-                "3. 如果没有检索到结果，必须返回“搜索结果为空”。\n"
-                "4. 禁止补充主观推断或模型自带知识。"
-            ),
-            "response_format": "text",
-            "enable_reasoning": False,
-            "enable_corner_markers": False,
-            "resource_type_filter": [
-                {"type": "image", "top_k": 3},
-                {"type": "web", "top_k": max(self.top_k, 6)},
-            ],
-            "model": "DeepSeek-R1",
-            "stream": False,
-        }
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        response = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
-        response.raise_for_status()
-        payload = response.json()
-
-        while not payload.get("choices"):
-            time.sleep(self.retry_delay)
-            response = requests.post(self.url, headers=headers, json=body, timeout=self.timeout)
-            response.raise_for_status()
-            payload = response.json()
-
-        messages = []
-        references = payload.get("references", [])
-        for item in payload.get("choices", []):
-            content = item.get("message", {}).get("content")
-            if content:
-                messages.append(content)
-
-        return "\n".join(messages), references
+    result_content = start_meeting(qwen_model, topic_meta["content"], stream)
+    print("\n\n====最终研究报告====\n\n", result_content)
 
 
-def _build_provider() -> SearchProviderBase:
-    provider_name = (config.get("search_provider", "baidu") or "baidu").lower()
-    if provider_name not in ("baidu", ""):
-        raise SearchProviderError("当前仅支持 Baidu AI Search。")
-    return BaiduAISearchProvider(config)
-
-
-_PROVIDER = None
-
-
-def web_search(search_message: str, search_recency_filter: str = "none"):
-    """统一对外暴露的搜索调用。"""
-    global _PROVIDER  # pylint: disable=global-statement
-    if _PROVIDER is None:
-        _PROVIDER = _build_provider()
-    return _PROVIDER.search(search_message, search_recency_filter or "none")
+if __name__ == "__main__":
+    main()
