@@ -86,6 +86,7 @@ class BaiduAISearchProvider(SearchProviderBase):
             raise SearchProviderError("缺少 Baidu AI Search 鉴权。")
 
     def _search(self, question: str, time_filter: str):
+        time.sleep(3)
         query = self._apply_recency_hint(question, time_filter)
         body = {
             "messages": [{"role": "user", "content": query}],

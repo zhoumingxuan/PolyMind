@@ -412,7 +412,7 @@ def search_list(question_list):
             continue
         time_range = item.get("time", "none")
 
-        print("需要搜索的问题:", question, "\n")
+        print("正在搜索的问题:", question, "\n")
         web_content, refs_items = web_search(question, time_range)
 
         results.append({

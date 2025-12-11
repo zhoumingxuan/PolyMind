@@ -36,3 +36,21 @@ PolyMind 把复杂需求分解给多名虚拟研究员，先补齐理解所需�
 ## 注意
 - 仅内置 Baidu AI Search，请确保网络和 Token 有效。
 - 所有输出为理论研究内容，Prompt 已限制行动导向与来源伪造。
+
+
+## 示例课题与快速运行
+- 快速体验：`python test.py`（默认 a_share_stock_pick）
+- 查看课题列表：`python test.py list`
+- 指定课题：`python test.py <key>`
+  - 示例：`python test.py a_share_stock_pick` / `python test.py a_share_sector_trend` / `python test.py ecommerce_arch` / `python test.py observability_platform`
+
+当前内置课题：
+- a_share_stock_pick —— A 股多因子选股与推荐（含投资建议）
+- a_share_sector_trend —— A 股未来热门板块与行情趋势（含配置建议）
+- ecommerce_arch —— 大型电商高并发架构演进方案
+- observability_platform —— 全链路可观测性与 SLO 平台方案
+
+## 手动添加课题
+1. 打开 `test.py`，在 `RESEARCH_TOPICS` 字典内新增一个条目，结构与现有示例一致（`title`、`description`、`content`）。
+2. 保持文件编码 UTF-8，内容写成多行字符串（`"""..."""`），包含目标、约束、输出要求等。
+3. 如需把新课题设为默认运行，可将其放在字典的第一个位置（默认用 `next(iter(RESEARCH_TOPICS))`）。

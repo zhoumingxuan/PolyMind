@@ -61,7 +61,7 @@ def create_webquestion_from_user(
         question = item["question"]
         time_range = item["time"]
 
-        print("\n需要搜索的问题:", question, "\n")
+        print("\n正在搜索的问题:", question, "\n")
         web_content, ref_items = web_search(question, time_range)
 
         refs.extend(ref_items)
