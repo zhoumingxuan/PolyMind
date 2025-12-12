@@ -1,95 +1,568 @@
 # -*- coding: utf-8 -*-
-import os
-import sys
+import json
+import re
+import time
+from html import unescape
+from typing import Dict, List, Tuple
+from search_anylyze import call_qwen_long
 
-sys.path.append(os.path.dirname(__file__))
+import requests
 
-from api_model import AIStream, QwenModel
-from meeting import start_meeting
+from config import ConfigHelper
 
-# 预置几个受大众关注的课题（A 股选股/板块趋势、系统架构），便于快速演示多智能体研究流程。
-RESEARCH_TOPICS = {
-    "a_share_stock_pick": {
-        "title": "A 股多因子选股与推荐（含投资建议）",
-        "description": "结合行业景气、财报质量、量价与事件/舆情信号，形成可解释的股票推荐与配置建议。",
-        "content": """
-面向中国 A 股（沪深市场）的多因子选股与推荐：
-- 目标：基于行业景气度、财报与现金流质量、量价动量、公告/新闻/研报舆情，形成可解释的股票候选清单与仓位建议。
-- 约束：覆盖大盘/中盘/小盘与流动性要求，控制单票/行业/风格暴露；需给出逻辑、数据来源、风险提示与止盈止损思路。
-- 输出：列出推荐股票及理由，给出仓位建议和风险场景（可包含备用观察名单）。
-""",
-    },
-    "a_share_sector_trend": {
-        "title": "A 股未来热门板块与行情趋势研究（含配置建议）",
-        "description": "研判未来 3-12 个月可能走强的板块与题材，给出配置比例与风险对冲思路。",
-        "content": """
-研究未来 3-12 个月可能走强的 A 股板块与题材，并形成配置建议：
-- 维度：宏观与政策动向、产业链景气度、估值与资金偏好、外部事件（地缘/供需/技术周期）。
-- 约束：给出板块/主题的配置比例建议，明确进场/减仓信号，提示高波动或监管风险；可提供代表性成分股示例。
-- 输出：板块排序、配置建议、代表性标的示例、风险对冲思路。
-""",
-    },
-    "ecommerce_arch": {
-        "title": "大型电商高并发架构演进方案",
-        "description": "面向大促/秒杀场景的高并发、高可用、弹性与降本架构设计。",
-        "content": """
-为大型电商平台设计高并发架构演进方案：
-- 场景：大促/秒杀、库存扣减、订单支付、风控、推荐/搜索的稳定性与延迟控制。
-- 约束：异地多活/容灾、降级限流策略、缓存与消息削峰、灰度与回滚；兼顾成本与可观测性。
-- 指标：峰值 QPS、尾延迟、可用性 SLA、故障恢复时间、资源成本与容量预测。
-""",
-    },
-    "observability_platform": {
-        "title": "全链路可观测性与 SLO 平台方案",
-        "description": "构建日志/指标/链路追踪统一的可观测性与 SLO 治理平台。",
-        "content": """
-设计面向中大型系统的可观测性平台：
-- 需求：日志/指标/链路追踪统一采集与关联，SLO/错误预算治理，异常检测与告警降噪。
-- 约束：多云/混合部署、数据留存与成本优化、敏感数据脱敏与合规；支持多语言与多运行时。
-- 指标：监控覆盖度、告警噪音率、定位耗时、SLO 达成率、存储/计算成本。
-""",
-    },
+try:
+    from bs4 import BeautifulSoup,Comment
+except Exception:  # pragma: no cover - optional dependency
+    BeautifulSoup = None
+
+try:
+    from playwright.sync_api import sync_playwright
+except Exception:  # pragma: no cover - optional dependency
+    sync_playwright = None
+
+
+config = ConfigHelper()
+
+# 可配置的过滤关键字
+_EXCLUDE_KEYWORDS = ("footer", "header", "nav", "menu", "helper")
+
+RECENCY_HINT = {
+    "week": "最近7天",
+    "month": "最近30天",
+    "semiyear": "最近180天",
+    "year": "最近365天",
 }
 
-
-def list_topics() -> None:
-    """打印可选课题及简介。"""
-    print("可选课题（键：标题 —— 简介）：")
-    for key, meta in RESEARCH_TOPICS.items():
-        print(f"- {key}: {meta['title']} —— {meta['description']}")
+_PLAYWRIGHT = None
+_BROWSER = None
 
 
-def pick_topic(args: list[str]):
+class SearchProviderError(RuntimeError):
+    """网络搜索提供方异常。"""
+
+
+class SearchProviderBase:
+    """所有搜索提供方的公共实现。"""
+
+    NAME = "base"
+
+    def __init__(self, cfg: ConfigHelper):
+        self.cfg = cfg
+        self._cache: Dict[str, Tuple[str, List[Dict]]] = {}
+        self.cooldown = float(cfg.get("search_cooldown", 1.0) or 1.0)
+        self.retry_delay = int(cfg.get("search_retry_delay", 30) or 30)
+
+    def _cache_key(self, question: str, time_filter: str) -> str:
+        return f"{question.strip()}|||{time_filter or 'none'}"
+
+    def _from_cache(self, question: str, time_filter: str):
+        key = self._cache_key(question, time_filter)
+        return self._cache.get(key)
+
+    def _store_cache(self, question: str, time_filter: str, data):
+        key = self._cache_key(question, time_filter)
+        self._cache[key] = data
+
+    def search(self, question: str, time_filter: str = "none"):
+        """统一的外部调用入口，带缓存与简单退避。"""
+        cached = self._from_cache(question, time_filter)
+        if cached:
+            return cached
+
+        try:
+            result = self._search(question, time_filter)
+        except SearchProviderError:
+            raise
+        except Exception:  # pylint: disable=broad-except
+            time.sleep(self.retry_delay)
+            result = self._search(question, time_filter)
+
+        self._store_cache(question, time_filter, result)
+        if self.cooldown:
+            time.sleep(self.cooldown)
+        return result
+
+    def _search(self, question: str, time_filter: str):
+        raise NotImplementedError
+
+    @staticmethod
+    def _apply_recency_hint(question: str, time_filter: str) -> str:
+        if not time_filter or time_filter == "none":
+            return question
+        hint = RECENCY_HINT.get(time_filter, "")
+        if not hint:
+            return question
+        return f"{question}（限定{hint}范围）"
+
+
+
+class BaiduAISearchProvider(SearchProviderBase):
+    """百度搜索 /v2/ai_search/web_search 纯检索提供方。"""
+
+    NAME = "baidu"
+
+    def __init__(self, cfg: ConfigHelper):
+        super().__init__(cfg)
+        self.api_key = cfg.get("baidu_key")
+        if not self.api_key:
+            raise SearchProviderError("缺少百度 AI 搜索密钥。")
+
+        # 搜索返回结果条数（仅web），默认给个 10，限制在 [1, 50]
+        self.top_k = int(cfg.get("search_top_k", 10) or 10)
+
+        # 版本：standard / lite，配置错了就不带，让服务端用默认值
+        edition = (cfg.get("baidu_search_edition") or "standard").lower()
+        self.edition = edition if edition in ("standard", "lite") else None
+
+        self.url = "https://qianfan.baidubce.com/v2/ai_search/web_search"
+        self.timeout = int(cfg.get("search_timeout", 30) or 30)
+
+    def _search(self, question: str, time_filter: str):
+        # 这里不再调用 _apply_recency_hint，不往 query 里加中文提示，
+        # 而是用官方的 search_recency_filter 参数控制时效。
+        body: Dict = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": question,
+                }
+            ],
+            "search_source": "baidu_search_v2",
+            "resource_type_filter": [
+                {
+                    "type": "web",
+                    "top_k": 50,
+                }
+            ],
+        }
+
+        # 可选：standard / lite
+        if self.edition:
+            body["edition"] = self.edition
+
+        # 将你现有的 time_filter 映射到官方 search_recency_filter
+        if time_filter in ("week", "month", "semiyear", "year"):
+            body["search_recency_filter"] = time_filter
+
+        headers = {
+            # 文档里有两种写法，这里两个头都带上，兼容性更好
+            "Authorization": f"Bearer {self.api_key}",
+            "X-Appbuilder-Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        response = requests.post(
+            self.url,
+            headers=headers,
+            json=body,
+            timeout=self.timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        # web_search 的主体结果都在 references 里
+        raw_refs = payload.get("references") or []
+
+        normalized_items: List[Dict] = []
+        for ref in raw_refs:
+            # 只保留我们上层真正需要的字段，其它放在原对象里也行，
+            # 但为了和 DashScope provider 的结构统一，这里做一次规整。
+            normalized_items.append(
+                {
+                    "title": ref.get("title"),
+                    "snippet": ref.get("snippet") or ref.get("content"),
+                    "publish_time": ref.get("date"),
+                    "url": ref.get("url"),
+                    "source": ref.get("website") or ref.get("web_anchor"),
+                    "rerank_score": ref.get("rerank_score"),
+                    "authority_score": ref.get("authority_score"),
+                }
+            )
+
+
+        return normalized_items
+
+
+
+def _build_provider() -> SearchProviderBase:
+    provider_name = (config.get("search_provider", "baidu") or "baidu").lower()
+
+    if provider_name == BaiduAISearchProvider.NAME:
+        return BaiduAISearchProvider(config)
+
+    raise SearchProviderError(f"未知的搜索提供方：{provider_name}")
+
+
+_PROVIDER = None
+
+
+def web_search(search_message: str, search_recency_filter: str = "none"):
+    """统一对外暴露的搜索函数。"""
+    global _PROVIDER  # pylint: disable=global-statement
+    if _PROVIDER is None:
+        _PROVIDER = _build_provider()
+
+    ref_items = _PROVIDER.search(search_message, search_recency_filter or "none") or []
+
+    def sort_key(item: Dict):
+        return (
+            float(item.get("authority_score") or 0),
+            float(item.get("rerank_score") or 0),
+        )
+
+    sorted_refs = sorted(ref_items, key=sort_key, reverse=True)
+    top_refs = sorted_refs[:10]
+
+    fetch_timeout = int(config.get("search_fetch_timeout", 20) or 20)
+    results: List[Dict] = []
+    seen_urls = set()
+
+    for ref in top_refs:
+        url = ref.get("url") or ""
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        time.sleep(3)
+        web_content = _fetch_url_content(url, timeout=fetch_timeout)
+        results.append(
+            {
+                "title": ref.get("title"),
+                "snippet": ref.get("snippet"),
+                "publish_time": ref.get("publish_time"),
+                "url": url,
+                "source": ref.get("source"),
+                "authority_score": ref.get("authority_score"),
+                "rerank_score": ref.get("rerank_score"),
+                "web_content": web_content,
+            }
+        )
+
+
+
+    # 取 title/publish_time/source/web_content/url 字段组成 JSON 字符串，供大模型整合并保留来源和时间
+    result_content = json.dumps(
+        [
+            {
+                "title": item.get("title"),
+                "publish_time": item.get("publish_time"),
+                "source": item.get("source"),
+                "snippet": item.get("snippet"),
+                "web_content": item.get("web_content"),
+                "url": item.get("url"),
+            }
+            for item in results
+        ],
+        ensure_ascii=False,
+    )
+
+    result=call_qwen_long(search_message,result_content)
+
+    return result
+
+def _get_playwright_page(timeout: int):
+    """获取一个 Playwright Page，多次调用共用浏览器实例。
+
+    若未安装 playwright 或启动失败，则返回 None。
     """
-    根据命令行参数选择课题；支持:
-    - `python test.py`           直接运行默认课题
-    - `python test.py list`      列出全部课题
-    - `python test.py <key>`     运行指定课题
+    global _PLAYWRIGHT, _BROWSER
+
+    if sync_playwright is None:
+        # 用户没装 playwright，直接放弃走回退逻辑
+        return None
+
+    # 首次或异常后重建浏览器实例
+    if _PLAYWRIGHT is None or _BROWSER is None:
+        try:
+            _PLAYWRIGHT = sync_playwright().start()
+            # 这里用 Chromium，你也可以改成 .firefox / .webkit
+            _BROWSER = _PLAYWRIGHT.chromium.launch(headless=True)
+        except Exception:
+            _PLAYWRIGHT = None
+            _BROWSER = None
+            return None
+
+    try:
+        page = _BROWSER.new_page()
+        # 统一设置默认超时（Playwright 单位是 ms）
+        page.set_default_timeout(timeout * 1000)
+        return page
+    except Exception:
+        return None
+
+
+def _prune_overlay_and_sensitive_blocks(soup: "BeautifulSoup") -> None:
+    """仅做两件事：
+    1) 删除明显的覆盖层/弹窗/横幅等（dialog/modal/popup/banner/overlay）；
+    2) 按敏感词命中删除块级节点（不做任何“正文保护/主块识别”）。
     """
-    if len(args) >= 2:
-        key = args[1].strip()
-        if key.lower() == "list":
-            list_topics()
-            sys.exit(0)
-        if key not in RESEARCH_TOPICS:
-            print(f"未找到课题 '{key}'，可选：{', '.join(RESEARCH_TOPICS.keys())}")
-            sys.exit(1)
-        return key, RESEARCH_TOPICS[key]
+    if soup is None:
+        return
 
-    default_key = next(iter(RESEARCH_TOPICS))
-    return default_key, RESEARCH_TOPICS[default_key]
+    # ---- 1) 删除覆盖层/弹窗/横幅（低误伤）----
+    OVERLAY_HINTS = (
+        "modal", "dialog", "popup", "overlay", "banner", "toast", "layer",
+        "mask", "backdrop", "float", "floating", "fixedbar",
+    )
+
+    def _attr_text(tag, name: str) -> str:
+        v = tag.get(name)
+        if not v:
+            return ""
+        if isinstance(v, (list, tuple)):
+            return " ".join(map(str, v)).lower()
+        return str(v).lower()
+
+    def _is_overlay(tag) -> bool:
+        role = _attr_text(tag, "role")
+        aria_modal = _attr_text(tag, "aria-modal")
+        if role in ("dialog", "alertdialog") or aria_modal == "true":
+            return True
+
+        cid = (_attr_text(tag, "id") + " " + _attr_text(tag, "class")).strip()
+        return bool(cid) and any(h in cid for h in OVERLAY_HINTS)
+
+    for bad in list(soup.find_all(_is_overlay)):
+        bad.decompose()
+
+    # ---- 2) 按敏感词块级剔除（只做敏感词，不做正文保护）----
+    raw_kw = (config.get("html_sensitive_keywords") or "").strip()
+    if raw_kw:
+        sensitive_kws = [k.strip().lower() for k in raw_kw.split(",") if k.strip()]
+    else:
+        sensitive_kws = [
+            # 中文（保守）
+            "博彩", "赌场", "投注", "娱乐城", "色情", "裸聊", "约炮", "招嫖", "代孕"
+        ]
+
+    if not sensitive_kws:
+        return
+
+    BLOCK_TAGS = ("div", "section", "article", "aside", "li", "p", "td")
+
+    def _contains_sensitive(text: str) -> bool:
+        t = (text or "").lower()
+        if not t:
+            return False
+        hits = 0
+        for kw in sensitive_kws:
+            hits += t.count(kw)
+            if hits >= 2:
+                return True
+        # 只命中 1 次时，为了尽量减少误删：仅在短块上触发（广告/引流块更常见）
+        return hits >= 1 and len(t) <= 600
+
+    for blk in list(soup.find_all(BLOCK_TAGS)):
+        txt = blk.get_text(" ", strip=True)
+        if txt and _contains_sensitive(txt):
+            blk.decompose()
+
+_DOC_LINK_EXTS = (".pdf", ".doc", ".docx")
+
+def _clean_body_html(html: str) -> str:
+    """在 _extract_body_html 之后做进一步清洗：
+
+    1) 删除 class / id 中包含 footer/header/nav/menu/helper 的元素；
+    2) 删除 <footer>、<ins> 等元素（整个元素）；
+    3) 若 <a> 标签不含“文档链接”（href 不含指定后缀），一律剔除整个 <a>；
+    4) 所有包含 data / data-* 属性的元素：清空其 data 属性的值（保留属性名）；
+    5) 删除所有 <img> 的 src 属性（保留 <img> 标签）；
+    6) 删除 HTML 注释；
+    7) 兜底：删除 body 中的 script/style 等。
+    """
+    if not html:
+        return ""
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return html
+
+    # 0) 兜底删除 body 内的明显非正文标签（按你要求扩展）
+    for s in soup.find_all(
+        ["script", "style", "footer", "ins", "time", "ul", "li", "form", "input", "button", "link", "head", "meta","object","svg"]
+    ):
+        s.decompose()
+
+    # 0.1) 删除 HTML 注释 <!-- ... -->
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        c.extract()
+
+    # 3) a 标签：非文档链接一律剔除（同时兼容 attrs=None、无 href）
+    def _is_doc_href(href: str) -> bool:
+        h = (href or "").strip().lower()
+        if not h:
+            return False
+        if h.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return False
+        return any(ext in h for ext in _DOC_LINK_EXTS)
+
+    for a in list(soup.find_all("a")):
+        attrs = getattr(a, "attrs", None)
+        if not isinstance(attrs, dict):
+            a.decompose()
+            continue
+
+        href_val = attrs.get("href", "")
+        href = href_val.strip().lower() if isinstance(href_val, str) else ""
+
+        if (not href) or (not _is_doc_href(href)):
+            a.decompose()
+
+    # 1) 删除命中 class/id 关键字的元素（防御：attrs 可能为 None）
+    def _should_remove(tag) -> bool:
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            return False
+
+        for attr_name in ("class", "id"):
+            val = attrs.get(attr_name)
+            if not val:
+                continue
+
+            if isinstance(val, (list, tuple)):
+                text = " ".join(map(str, val))
+            else:
+                text = str(val)
+
+            text = text.lower()
+            if any(kw in text for kw in _EXCLUDE_KEYWORDS):
+                return True
+
+        return False
+
+    for bad in list(soup.find_all(_should_remove)):
+        bad.decompose()
+
+    # 覆盖层/敏感块剔除逻辑保留
+    _prune_overlay_and_sensitive_blocks(soup)
+
+    # 4) 清空 data / data-* 属性值（防御：attrs 可能为 None）
+    for tag in soup.find_all(True):
+        attrs = getattr(tag, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        for attr in list(attrs.keys()):
+            al = str(attr).lower()
+            if al == "data" or al.startswith("data-"):
+                attrs[attr] = ""
+
+    # 5) 删除 <img> 的 src（防御：attrs 可能为 None）
+    for img in soup.find_all("img"):
+        attrs = getattr(img, "attrs", None)
+        if isinstance(attrs, dict):
+            attrs.pop("src", None)
+
+    if soup.body is not None:
+        return str(soup.body)
+    return str(soup)
+
+def _fetch_url_content(url: str, timeout: int = 15) -> str:
+    """下载网页并返回 <body> 的 HTML。
+
+    流程保持不变：
+    - 先 Playwright：page.content() -> _extract_body_html()（抽取 body + 删 script/style）
+                      -> _clean_body_html()
+    - 再 fallback 为 requests：字节级解码 -> _extract_body_html() -> _clean_body_html()
+    """
+    if not url:
+        return ""
+
+    # 1. 优先 Playwright
+    page = _get_playwright_page(timeout)
+    if page is not None:
+        try:
+            page.goto(url, wait_until="networkidle")
+            html = page.content()
+            page.close()
+            html = (html or "").strip()
+            if html:
+                # 这里仍然调用你原来的逻辑：抽取 body + 删除 body 内 script/style
+                body_html = _extract_body_html(html)
+                # 在此基础上再加 class/id 过滤 和 img 去 src
+                body_html = _clean_body_html(body_html)
+                return body_html.strip()
+        except Exception:
+            try:
+                page.close()
+            except Exception:
+                pass
+            # 继续走 requests 兜底
+
+    # 2. 回退方案：requests + 显式编码处理
+    try:
+        response = requests.get(
+            url,
+            timeout=timeout,
+            headers={"User-Agent": "PolyMindBot/1.0"},
+        )
+        response.raise_for_status()
+    except Exception:
+        return ""
+
+    raw = response.content or b""
+
+    # 2.1 响应头 charset
+    encoding: Optional[str] = None
+    content_type = response.headers.get("content-type", "").lower()
+    m = re.search(r"charset=([\w\-]+)", content_type)
+    if m:
+        encoding = m.group(1).strip("'\" ").lower()
+
+    # 2.2 若没写 charset，从 meta 里探测（只看前几 KB）
+    if not encoding and raw:
+        head = raw[:8192].decode("ascii", errors="ignore")
+        m_meta = re.search(
+            r"(?is)<meta[^>]+charset=['\"]?\s*([a-zA-Z0-9_\-]+)\s*['\"]?",
+            head,
+        )
+        if m_meta:
+            encoding = m_meta.group(1).strip().lower()
+
+    # 2.3 再退一步，用 apparent_encoding
+    if not encoding:
+        try:
+            encoding = (response.apparent_encoding or "").lower()
+        except Exception:
+            encoding = ""
+
+    # 2.4 统一中文编码
+    if encoding in ("gb2312", "gbk", "gb-2312", "gb_2312"):
+        encoding = "gb18030"
+    if not encoding:
+        encoding = "utf-8"
+
+    # 2.5 解码
+    try:
+        text = raw.decode(encoding, errors="replace")
+    except LookupError:
+        text = raw.decode("utf-8", errors="replace")
+
+    # 只对 HTML 做 body 抽取 + 清洗
+    if "html" in content_type:
+        # 先用原有函数抽 body + 去 script/style
+        text = _extract_body_html(text)
+        # 再做 class/id 过滤 和 img 去 src
+        text = _clean_body_html(text)
+
+    return text.strip()
 
 
-def main():
-    topic_key, topic_meta = pick_topic(sys.argv)
-    print(f"\n即将启动课题：{topic_meta['title']} ({topic_key})\n{topic_meta['description']}\n")
 
-    stream = AIStream()
-    qwen_model = QwenModel(model_name="qwen3-max")
+def _extract_body_html(html: str) -> str:
+    """获取<body>部分并移除脚本/样式，优先使用 BeautifulSoup。"""
+    if BeautifulSoup:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style"]):
+            tag.decompose()
+        body = soup.body
+        if body:
+            return str(body)
+        # 无 body 时退回整个文档（已去脚本/样式）
+        return str(soup)
 
-    result_content = start_meeting(qwen_model, topic_meta["content"], stream)
-    print("\n\n====最终研究报告====\n\n", result_content)
-
-
-if __name__ == "__main__":
-    main()
+    # 简单正则回退：截 body，去 script/style，保留剩余 HTML
+    body_match = re.search(r"(?is)<body[^>]*>(.*?)</body>", html)
+    body_html = body_match.group(1) if body_match else html
+    body_html = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", body_html)
+    body_html = re.sub(r"\s+", " ", body_html)
+    return unescape(body_html).strip()

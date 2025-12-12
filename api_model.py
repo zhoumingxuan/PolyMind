@@ -145,8 +145,7 @@ class QwenModel:
             refs = []
 
             if func_name == "web_search":
-                data_content, ref_data = search_list(**args)
-                refs.extend(ref_data)
+                data_content = search_list(**args)
 
             # content 必须为字符串
             messages.append({
@@ -156,9 +155,8 @@ class QwenModel:
             })
 
             all_data.extend(data_content or [])
-            all_refs.extend(refs or [])
 
-        return all_data, all_refs
+        return all_data
 
     def send_messages(
         self,
@@ -368,11 +366,10 @@ class QwenModel:
             # 直接把 tool_response 作为消息加入（沿用你早期写法的习惯）
             messages.append(tool_response)
 
-            web_search_list, web_references = self.do_tool_calls(
+            web_search_list = self.do_tool_calls(
                 tool_response["tool_calls"], messages
             )
             web_content_list.extend(web_search_list or [])
-            references.extend(web_references or [])
 
             answer, reasoning, tool_response = self.send_messages(
                 messages,
@@ -413,12 +410,11 @@ def search_list(question_list):
         time_range = item.get("time", "none")
 
         print("正在搜索的问题:", question, "\n")
-        web_content, refs_items = web_search(question, time_range)
+        web_content = web_search(question, time_range)
 
         results.append({
             "question": question,
             "result": web_content
         })
-        refs.extend(refs_items)
 
-    return results, refs
+    return results

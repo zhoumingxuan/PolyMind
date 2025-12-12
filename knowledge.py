@@ -31,7 +31,7 @@ def create_webquestion_from_user(
 
 ## 输出格式
 - 严格输出原始 JSON 文本，不得附加 Markdown 代码块符号、反引号、注释、自然语言前后缀或任何非 JSON 内容。
-- 返回 JSON 数组，每个元素包含字段：
+- 返回 JSON 数组，长度必须大于等于3，每个元素包含字段：
   - id: 字符串，使用 GUID 或其他全局唯一标识
   - question: 字符串，具体的搜索问题
   - time: 字符串，只能为 "none"、"week"、"month"、"semiyear"、"year"，用于限定结果时效性
@@ -55,23 +55,20 @@ def create_webquestion_from_user(
 
     data = json.loads(answer)
 
-    refs = []
     results = []
     for item in data:
         question = item["question"]
         time_range = item["time"]
 
         print("\n正在搜索的问题:", question, "\n")
-        web_content, ref_items = web_search(question, time_range)
-
-        refs.extend(ref_items)
+        web_content = web_search(question, time_range)
 
         results.append({
             "question": question,
             "result": web_content
         })
 
-    return results, refs
+    return results
 
 def sanitize_knowledge_base(knowledge_text):
     """剔除推荐、方案类内容，仅保留理解所需信息。"""
@@ -91,7 +88,7 @@ def sanitize_knowledge_base(knowledge_text):
     return "\n".join(lines).strip()
 
 
-def rrange_knowledge(qwen_model: QwenModel, knowledges, references, now_date, user_content):
+def rrange_knowledge(qwen_model: QwenModel, knowledges, now_date, user_content):
     """
     基于网络检索结果，整理出“刚好足以理解用户需求”的基础知识列表。
 
@@ -166,14 +163,14 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, now_date, us
 
 ## 特别说明（非常重要）
 1. 只能基于输入的检索结果和引用信息进行整理，禁止凭空补充或想象细节。
-2. 来源只能在"相关引用"中能够查找到**真实存在**的条目。
+2. 来源只能在"网络检索结果"中能够查找到**真实存在**的条目。
 3. 禁止自行写网站名/作者/标题/日期等自由文本来源信息。
-   这些信息只允许在你看到的原条目中**原样复制**。
-4. 若某知识点缺少可核对的来源条目：必须**直接不输出该知识点**。
-5. 若找搜索结果找不到"相关引用"对应的引用信息，则直接删除该知识点，绝对禁止使用“综合/推断/网络检索结果第N条”来替代。
-6. 当资料不足以给出某个细节时，宁可不写，也不要猜测或用模糊语气填充。
-7. 严禁在输出中出现任何“删除/已删除/故此条删除/未找到对应条目”等字样。
-8. 严禁解释你为什么不写某条内容。
+4. 这些信息只允许在你看到的原条目中**原样复制**。
+5. 若某知识点缺少可核对的来源条目：必须**直接不输出该知识点**。
+6. 绝对禁止使用“综合/推断/网络检索结果第N条”来替代。
+7. 当资料不足以给出某个细节时，宁可不写，也不要猜测或用模糊语气填充。
+8. 严禁在输出中出现任何“删除/已删除/故此条删除/未找到对应条目”等字样。
+9. 严禁解释你为什么不写某条内容。
 """
 
     user_prompt = f"""
@@ -182,15 +179,11 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, references, now_date, us
 {user_content}
 ```
 
-# 网络检索结果（供你筛选、压缩）
+# 网络检索结果（供你筛选）
 ```
 {json.dumps(knowledges, ensure_ascii=False, indent=2)}
 ```
 
-# 相关引用（同样仅供筛选使用）
-```
-{json.dumps(references, ensure_ascii=False, indent=2)}
-```
 """
 
     answer, reasoning, web_content_list, reference_list = qwen_model.do_call(
