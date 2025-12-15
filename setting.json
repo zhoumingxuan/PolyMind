@@ -1,0 +1,9 @@
+{
+    "max_epcho": 5,
+    "role_count": 5,
+    "qwen_key": "",
+    "baidu_key": "",
+    "search_provider": "baidu",
+    "search_top_k": 10,
+    "search_fetch_timeout": 120
+}
