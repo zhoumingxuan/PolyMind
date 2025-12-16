@@ -175,8 +175,6 @@ def rrange_knowledge(qwen_model: QwenModel, knowledges, now_date, user_content):
 
 """
 
-    print("\n\n知识条目:",knowledges)
-
     answer, reasoning, web_content_list, reference_list = qwen_model.do_call(
         system_prompt, user_prompt, no_search=True, inner_search=False
     )
