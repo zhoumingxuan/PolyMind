@@ -4,7 +4,7 @@ import re
 import time
 from html import unescape
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from search_anylyze import (
     call_qwen_long,
     _filter_accessible_doc_urls,
@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover - optional dependency
 config = ConfigHelper()
 
 # 可配置的过滤关键字
-_EXCLUDE_KEYWORDS = ("footer", "header", "nav", "menu", "helper","dialog","modal")
+_EXCLUDE_KEYWORDS = ("footer", "header", "nav", "menu", "helper","dialog","modal","csdn","repo")
 _DOC_LINK_EXTS = (".pdf", ".doc", ".docx")
 
 RECENCY_HINT = {
@@ -210,6 +210,39 @@ def _is_document_url(url: str) -> bool:
     return any(path.endswith(ext) for ext in _DOC_LINK_EXTS)
 
 
+def _extract_doc_ext_from_disposition(content_disposition: str) -> str:
+    """从 Content-Disposition 中提取文件扩展名（小写，含点），否则返回空字符串。"""
+    disposition = (content_disposition or "").strip()
+    if not disposition:
+        return ""
+
+    filename = ""
+    for part in disposition.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip().lower()
+        if name not in ("filename", "filename*"):
+            continue
+        filename = value.strip().strip("\"'")
+        if name == "filename*" and "''" in filename:
+            filename = filename.split("''", 1)[1]
+        break
+
+    if not filename:
+        return ""
+
+    try:
+        filename = unquote(filename)
+    except Exception:
+        pass
+
+    dot = filename.rfind(".")
+    if dot == -1:
+        return ""
+    return filename[dot:].lower()
+
+
 def _is_doc_content_type(content_type: str) -> bool:
     """通过 Content-Type 判断是否为文档类内容。"""
     ct = (content_type or "").lower()
@@ -228,13 +261,13 @@ def _is_doc_content_type(content_type: str) -> bool:
     )
 
 
-def _probe_content_type(url: str, timeout: int = 15) -> Tuple[bool, str]:
+def _probe_content_type(url: str, timeout: int = 15) -> Tuple[bool, str, str]:
     """
     HEAD 优先尝试，若失败/405/4xx 再用 GET(stream=True) 取头，
-    返回 (ok, content_type)，只用于决策，不读取内容。
+    返回 (ok, content_type, content_disposition)，只用于决策，不读取内容。
     """
     if not url:
-        return False, ""
+        return False, "", ""
 
     headers = {"User-Agent": "PolyMindBot/1.0"}
 
@@ -253,6 +286,7 @@ def _probe_content_type(url: str, timeout: int = 15) -> Tuple[bool, str]:
         resp = _req("HEAD")
         code = int(resp.status_code or 0)
         content_type = resp.headers.get("content-type", "")
+        content_disposition = resp.headers.get("content-disposition", "")
         resp.close()
 
         if code == 405 or code >= 400 or code == 0:
@@ -260,24 +294,41 @@ def _probe_content_type(url: str, timeout: int = 15) -> Tuple[bool, str]:
             code = int(resp.status_code or 0)
             if not content_type:
                 content_type = resp.headers.get("content-type", "")
+            if not content_disposition:
+                content_disposition = resp.headers.get("content-disposition", "")
             resp.close()
 
         ok = 200 <= code < 400
-        return ok, content_type
+        return ok, content_type, content_disposition
     except Exception:
         if resp is not None:
             try:
                 resp.close()
             except Exception:
                 pass
-        return False, ""
+        return False, "", ""
 
 
-def _should_use_doc_parser(url: str, content_type: str) -> bool:
-    """先基于 Content-Type 判断，再用 URL 后缀作为备份。"""
-    if _is_doc_content_type(content_type):
+def _should_use_doc_parser(url: str, content_type: str, content_disposition: str = "") -> bool:
+    """
+    判断是否走文档解析：
+    1) Content-Type 已明确为文档，直接走文档解析；
+    2) Content-Type 为 application/octet-stream 时，仅查看 Content-Disposition 的文件名后缀；
+       若能识别出 PDF/DOC/DOCX，则走文档解析；
+    3) Content-Type 为空时，再退回 URL 后缀兜底。
+    """
+    ct = (content_type or "").lower()
+    if _is_doc_content_type(ct):
         return True
-    if not content_type:
+
+    if "application/octet-stream" in ct:
+        disp_ext = _extract_doc_ext_from_disposition(content_disposition)
+        if disp_ext in _DOC_LINK_EXTS:
+            return True
+        # octet-stream 未识别出文件后缀则不再视为文档
+        return False
+
+    if not ct:
         return _is_document_url(url)
     return False
 
@@ -339,8 +390,10 @@ def web_search(search_message: str, search_recency_filter: str = "none"):
             continue
         seen_urls.add(url)
         time.sleep(3)
-        ok_ct, content_type = _probe_content_type(url, timeout=fetch_timeout)
-        is_doc = _should_use_doc_parser(url, content_type)
+        _ok_ct, content_type, content_disposition = _probe_content_type(
+            url, timeout=fetch_timeout
+        )
+        is_doc = _should_use_doc_parser(url, content_type, content_disposition)
 
         web_content = ""
         if is_doc:
@@ -385,11 +438,11 @@ def web_search(search_message: str, search_recency_filter: str = "none"):
     result = ""
     try:
         result = call_qwen_long(search_message, result_content)
-    except Exception:
+    except Exception as e:
         if len(result_content)>1024*32:
-            print("Error;",url_list)
+            print("Error;",url_list, "\nInfo:",e)
         else:
-           print("Error:",result_content)
+           print("Error:",result_content,"\nInfo:",e)
 
     return result
 
