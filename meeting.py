@@ -705,7 +705,10 @@ def start_meeting(qwen_model: QwenModel, content, stream: AIStream = None):
     print("\n\n用户需求", content, "\n\n")
 
     print("\n====正在解读用户需求，构建基础知识库===\n")
-    know_list = create_webquestion_from_user(qwen_model, content, now_date)
+    know_list=[]
+    while len(know_list)<=0:
+      know_list = create_webquestion_from_user(qwen_model, content, now_date)
+
     knowledge_content = rrange_knowledge(qwen_model, know_list, now_date, content)
     print(knowledge_content)
 
