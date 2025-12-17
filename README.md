@@ -1,63 +1,92 @@
-# 多智能体协作讨论研究
-PolyMind 把复杂需求分解给多名虚拟研究员，先补齐理解所需的背景知识，再经多轮协作辩论，收敛出唯一方案和结构化研究报告。
+# PolyMind 多智能体协作讨论
 
-## 功能与目标
-- **拆题与知识补足**：自动生成检索问题、联网搜索、压缩为“刚好读懂需求”的背景，剔除推荐/行动类噪声。
-- **角色分工与对话推进**：依据配置生成带个性与思维特长的研究员，按轮次规则发言、互相质询与补证，避免重复与跑题。
-- **方案生成与收敛**：先给出多条可行思路，首轮收敛为双方案，次轮取舍统一为唯一方案，后续只做报告精修。
-- **报告生成与守护**：依据统一方案写出研究报告初稿，迭代补强；严格禁止行动导向与伪造来源，确保表述可追溯、结构化。
-- **稳健执行**：流式输出、批量检索、异常重试与节流，支持长对话与多轮讨论不中断。
+> 全仓库文件与输出均使用 UTF-8 编码，请保持编辑器/终端为 UTF-8。  
+> 依赖网络访问 DashScope 与百度 AI Search。
 
-## 整体逻辑链路
-1. **理解需求**：生成 question list → 联网检索 → 压缩成最小必需知识。
-2. **搭建起点**：输出多条初始方案；生成固定数量的研究员角色。
-3. **多轮协作讨论**：  
-   - **第 1 轮：摸索与对比**  
-     - 研究员要求：围绕同一需求从不同切口给出完整方案，优先覆盖未被触及的角度；必要时主动检索补证，避免主观猜测。  
-     - 处理方式：对比各方案的事实支撑与可行性，剔除无依据路径，收敛为两个候选方案。  
-   - **第 2 轮：取舍与统一**  
-     - 研究员要求：围绕两个候选方案逐条核实关键事实，提出冲突点并用检索补证或弱化；鼓励保留可融优势。  
-     - 处理方式：对照支持/反对证据和适用边界，选定唯一方案；形成报告初稿（保持理论层面，无行动指令）。  
-   - **第 3 轮及以后：报告精修与停机判断**  
-     - 研究员要求：仅在最终方案框架内补全缺口、澄清边界、补注来源，对无依据内容做降级或删除。  
-     - 处理方式：修订报告后执行停止判定；若关键维度仍缺或存在高影响争议，则继续下一轮，否则结束。
-4. **结果产出**：返回最终统一方案及对应研究报告（若未到报告阶段则返回方案文本）。
+## 项目概述
+- 多智能体深度研讨流程：拆解需求 → 补齐背景知识 → 多轮角色讨论 → 收敛方案/报告。
+- 内置检索工具：调用百度 AI Search（v2/ai_search/web_search），按权威度去重、按需渲染网页正文，聚合为结构化 JSON。
+- 文档解析链路：自动识别结果中的 PDF/DOC/DOCX 链接，优先用 `qwen-doc-turbo`，必要时回退本地解析（pdfplumber/python-docx）并由 `qwen-long` 总结。
+- 入口示例位于 `test.py`，`meeting.py` 负责多轮讨论编排，`search_service.py`/`search_anylyze.py` 负责检索与文档处理。
 
-## 达成的效果
-- 在有限轮次内，从模糊需求走到清晰、可解释、单一的研究方案。
-- 讨论过程可追溯：每轮有规则、有检索、有证据补强，避免主观臆断。
-- 报告结构清晰、来源可查、无行动导向，更易直接复用或二次编辑。
+## 目录速览
+- `test.py`：示例入口（默认模型 `qwen3-max`）。
+- `meeting.py`：多轮讨论/收敛主流程。
+- `knowledge.py`：根据用户需求生成检索问题、整理基础知识。
+- `api_model.py`：DashScope 封装，含工具调用与重试逻辑。
+- `search_service.py`：百度搜索、网页抓取与正文清洗（可选 Playwright + BeautifulSoup）。
+- `search_anylyze.py`：文档 URL 过滤、下载、解析与大模型总结。
+- `role.py`：角色生成与逐轮发言规则。
+- `config.py`：读取 `setting.json`。
+- `setting.json`：示例配置（UTF-8）。
 
-## 使用方式（简）
-1. 安装依赖（Python 3.10+）：`pip install dashscope requests`
-2. 配置 `setting.json`（UTF-8）：填写 `qwen_key`、`baidu_key`，可选调整 `role_count`、`max_epcho`。
-3. 运行示例：`python test.py`，或在业务中调用 `start_meeting(model, "你的研究需求", stream)`。
+## 环境要求
+- Python 3.10+
+- 可访问互联网（DashScope、百度 AI Search）。
+- DashScope API Key：`qwen_key`（用于 `qwen3-max` / `qwen-long` / `qwen-doc-turbo`）。
+- 百度 AI Search Key：`baidu_key`（/v2/ai_search/web_search）。
+- 可选：`antiword` / `catdoc` / `libreoffice`（soffice）用于 `.doc` 回退解析。
 
-## 注意
-- 仅内置 Baidu AI Search，请确保网络和 Token 有效。
-- 所有输出为理论研究内容，Prompt 已限制行动导向与来源伪造。
-- 当前搜索能力为自研实现，测试尚未覆盖全部场景，可能会出现报错或异常，使用时请留意并及时反馈。
+## 安装依赖
+必装 Python 包（避免编码问题，请确保终端为 UTF-8）：
+```bash
+pip install -U pip
+pip install dashscope requests pdfplumber python-docx
+```
 
-### 搜索实现特色（自研管线）
-- 默认调用 Baidu AI Search（/v2/ai_search/web_search）拿到 top 结果，按权威度/重排得分排序去重。
-- 对每个结果按需用 Playwright 渲染获取 `body`，失败则回退到 `requests` + 编码探测，清理脚本/样式/无关块后保留主体 HTML。
-- 自动识别 PDF/DOC/DOCX 链接：先做可达性检查，再用 `qwen-doc-turbo` 批量解析生成文档描述；若解析失败则回退到常规页面抓取。
-- 最终将 title/publish_time/source/snippet/web_content/url 打包为 JSON 供大模型整合，确保来源与时间可追溯。
+推荐/可选增强：
+```bash
+pip install beautifulsoup4 playwright   # 网页清洗与浏览器渲染
+python -m playwright install chromium   # 首次安装 Playwright 需拉取浏览器
+```
+- 如需更快的 HTML 解析，可额外 `pip install lxml`（BeautifulSoup 会自动使用）。
+- `.doc` 回退解析需系统工具：安装 `antiword` 或 `catdoc`，或安装 LibreOffice 并确保 `soffice` 可用。
 
+## 配置
+编辑 `setting.json`（保持 UTF-8）：
+- `qwen_key`：DashScope Key。
+- `baidu_key`：百度 AI Search Key。
+- `max_epcho`：讨论最大轮次（默认 5）。
+- `role_count`：研讨角色数量（默认 5）。
+- `search_provider`：检索提供方，目前支持 `baidu`。
+- `search_top_k`：单次搜索返回条数（1-50，默认 10）。
+- `search_fetch_timeout`：网页抓取/渲染超时秒数。
+- 其他字段：`search_cooldown`、`search_retry_delay`、`search_timeout` 等可按需在配置中追加。
 
 ## 示例课题与快速运行
-- 快速体验：`python test.py`（默认 a_share_stock_pick）
-- 查看课题列表：`python test.py list`
-- 指定课题：`python test.py <key>`
-  - 示例：`python test.py a_share_stock_pick` / `python test.py a_share_sector_trend` / `python test.py ecommerce_arch` / `python test.py observability_platform`
+```bash
+# 查看课题列表
+python test.py list
 
-当前内置课题：
-- a_share_stock_pick —— A 股多因子选股与推荐（含投资建议）
+# 运行默认课题（当前为 a_share_sector_trend）
+python test.py
+
+# 指定课题
+python test.py <key>
+```
+- `start_meeting` 的示例需求文案写在 `test.py` 中，可替换为 `RESEARCH_TOPICS[key]["content"]` 或任意自定义文本。
+- 文档解析产生的文件会写入 `download/` 目录（自动创建）。
+
+## 当前内置课题
 - a_share_sector_trend —— A 股未来热门板块与行情趋势（含配置建议）
-- ecommerce_arch —— 大型电商高并发架构演进方案
-- observability_platform —— 全链路可观测性与 SLO 平台方案
+- two_sessions_science_advice —— 两会热点驱动的科技政策建议
+- ai_safety_theory —— AI 可信安全的理论与可验证框架
+- realtime_risk_arch —— 金融级实时风控与事件驱动架构设计
 
 ## 手动添加课题
-1. 打开 `test.py`，在 `RESEARCH_TOPICS` 字典内新增一个条目，结构与现有示例一致（`title`、`description`、`content`）。
-2. 保持文件编码 UTF-8，内容写成多行字符串（`"""..."""`），包含目标、约束、输出要求等。
-3. 如需把新课题设为默认运行，可将其放在字典的第一个位置（默认用 `next(iter(RESEARCH_TOPICS))`）。
+1) 打开 `test.py`，在 `RESEARCH_TOPICS` 字典内新增一条，结构与现有示例一致（`title`、`description`、`content`）。  
+2) 保持文件编码 UTF-8，`content` 用多行字符串 `"""..."""` 写明目标、约束、输出要求等。  
+3) 若要设为默认运行，将新课题放在字典的第一个位置（默认取 `next(iter(RESEARCH_TOPICS))`）。
+
+## 注意
+- 仅内置 Baidu AI Search，请确保网络通畅并配置有效 Token。
+- 所有输出为理论研究内容，Prompt 已限制行动导向与来源伪造。
+- 当前搜索链路为自研实现，测试未覆盖全部场景，可能出现报错或异常，使用时请留意并反馈。
+- 全部文件与输出均使用 UTF-8，避免 ANSI/GBK 等编码导致乱码。
+- Playwright 未安装时会回退纯 `requests` 抓取，正文还原度可能下降；`.doc` 回退依赖 `antiword`/`catdoc`/`soffice`，缺失则无法处理该类文档。
+
+### 搜索实现特色（自研管线）
+- 默认调用 Baidu AI Search（/v2/ai_search/web_search）获取 top 结果，按权威度/重排得分排序去重。
+- 每条结果优先用 Playwright 渲染提取 `body`，失败则回退 `requests` + 编码探测；清理脚本/样式/无关块后保留主体 HTML。
+- 自动识别 PDF/DOC/DOCX 链接：先做可达性检查，再尝试 `qwen-doc-turbo` 批量解析；若不支持则下载到本地用 pdfplumber/python-docx 解析，并交给 `qwen-long` 细致总结；仍失败则回退常规页面抓取。
+- 最终汇总为包含 title/publish_time/source/snippet/web_content/url 的 JSON，方便大模型整合并保证来源与时间可追溯。
