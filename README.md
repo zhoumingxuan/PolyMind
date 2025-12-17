@@ -16,14 +16,22 @@
 - **风险与约束澄清**：在研讨中强制列出时间/地点/主体/前提等边界条件，减少决策中的假设遗漏与风险盲区。
 - **多话题批量起步**：通过预置/自定义 `RESEARCH_TOPICS`，快速起步不同主题，统一流程、统一搜索与总结规范。
 
-## 工作流概览（对应代码）
-1) **课题选择**：`test.py` 通过 `pick_topic` 从 `RESEARCH_TOPICS` 选题；主流程调用 `start_meeting`。  
-2) **问题生成与基础知识构建**：`knowledge.create_webquestion_from_user` 结合当前日期生成检索问题组并调用 `web_search`；结果经 `rrange_knowledge` 清洗、去行动导向、去推荐类内容。  
-3) **初始方案**：`meeting.create_initial_solution` 产出首版方案框架（仅理论层面的结构）。  
-4) **角色设定**：`knowledge.create_roles` + `meeting` 生成多角色（数量由 `role_count` 控制），并在每轮按序发言。  
-5) **多轮讨论与收敛**：`role.role_talk`/`role_dissucess` 在每轮附带搜索工具调用；`meeting` 中按轮次调用 `summarize_and_consolidate_solutions`（收敛为双方案）、`summarize_and_select_final_plan`（确定唯一方案）、`generate_report_from_plan`/`refine_report`（迭代报告），并用 `evaluate_discussion_status` 判断是否提前终止（受 `max_epcho` 控制）。  
-6) **搜索与文档解析链路**：`search_service.web_search` 统一入口，具备缓存、冷却与时间范围；`search_anylyze` 识别 PDF/DOC/DOCX，先 `qwen-doc-turbo`，再必要时本地下载 + `pdfplumber`/`python-docx` + `qwen-long` 回退。抓取正文使用 Playwright 优先，失败回退 `requests`，并进行 class/id/敏感词过滤、编码探测。  
-7) **输出与存储**：下载文件落在 `download/`；搜索结果结构化为含来源/时间的 JSON 供大模型引用；整体输出均限制为理论研究内容。
+## 设计目的与可解决的问题
+- **构造可追溯的多轮研究流程**：`meeting.py`/`role.py` 将讨论拆为多轮，控制角色视角、搜索行为与停机条件，避免随意跳结论。  
+- **让大模型基于真实来源说话**：`search_service.py` + `search_anylyze.py` 强制外部检索、正文抓取和文档解析，生成含来源/时间的 JSON，再交由大模型整合，减少凭空猜测。  
+- **快速补齐、澄清需求背景**：`knowledge.py` 自动生成检索问题，补齐需求相关的定义、术语、边界条件；刻意剔除行动/推荐类表述，避免讨论未开始就把方向“锁死”，让后续模型先准确理解需求本身（知识库主要供后续推理使用）。  
+- **在复杂议题上形成结构化方案/报告**：`create_initial_solution` → 收敛双方案 → 选定唯一方案 → 迭代报告，帮助在开放问题上输出结构化思考而非碎片讨论。  
+- **可读文档来源友好**：自动识别并解析 PDF/DOC/DOCX，可覆盖论文、法规/政策文书、法律文件等可读文档；必要时本地提取文本，再由 `qwen-long` 总结并标注页/块，解决长文档难读、来源难追的问题。  
+- **模板化复用**：`test.py` 的 `RESEARCH_TOPICS` 提供可复用话题模版，便于快速切换议题或自定义，保持同一套管线与约束。  
+
+## 工作流概览
+1) 选题启动：`test.py` 从 `RESEARCH_TOPICS` 选择课题并调用 `start_meeting`。  
+2) 补齐背景：`knowledge.py` 自动生成检索问题，调用 `web_search` 拉取资料，`rrange_knowledge` 只保留理解需求所必需的定义/背景。  
+3) 起草方案：`meeting.create_initial_solution` 给出首版方案框架（纯理论、无行动）。  
+4) 多角色讨论：`create_roles` 生成若干研究员，按轮次发言并可多次检索补证。  
+5) 收敛与报告：第一轮收敛为两个候选方案，第二轮选出唯一方案并生成初稿，此后只做报告精修，`evaluate_discussion_status` 判定是否结束。  
+6) 检索与文档解析：`search_service` 统一搜索入口；`search_anylyze` 识别 PDF/DOC/DOCX，优先 `qwen-doc-turbo`，必要时本地解析再由 `qwen-long` 总结；网页正文优先 Playwright，失败回退 `requests` 并做清洗。  
+7) 输出与保存：下载文件保存在 `download/`；搜索结果会被结构化为含来源/时间的 JSON，所有输出均保持理论研究属性。
 
 ## 流程细节与约束
 - **研究轮次**：默认 `max_epcho=5`；第 1 轮侧重摸清方向、生成两条候选方案；第 2 轮对比核验并收敛到唯一方案、生成首版报告；后续轮次仅在既定方案内精修报告并判定是否停机。  
@@ -53,7 +61,7 @@
 ## 环境要求
 - Python 3.10+
 - 可访问互联网（DashScope、百度 AI Search）。
-- DashScope API Key：`qwen_key`（用于 `qwen3-max` / `qwen-long` / `qwen-doc-turbo`）。
+- DashScope API Key：`qwen_key`（用于 `qwen3-max` / `qwen-long` / `qwen-doc-turbo` 等）。
 - 百度 AI Search Key：`baidu_key`（/v2/ai_search/web_search）。
 - 可选：`antiword` / `catdoc` / `libreoffice`（soffice）用于 `.doc` 回退解析。
 
